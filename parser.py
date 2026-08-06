@@ -9,6 +9,8 @@ import re
 import base64
 import json
 import hashlib
+import random
+import os
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Dict, List, Set, Tuple, Optional, Any
@@ -31,6 +33,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Константы
+OUTPUT_DIR = 'output'
+SPEED_TEST_URL = 'https://speed.hetzner.de/100MB.bin'  # Файл 100KB для теста скорости (используем меньший фрагмент)
+SPEED_THRESHOLD_KBPS = 300  # Порог скорости в КБ/с для бонусных баллов
+PROFILE_LIFETIME_DAYS = 7  # Срок жизни профилей в днях
+BAD_CHANNELS_THRESHOLD = 20  # Порог качества для bad_channels.txt
+
 
 @dataclass
 class ProtocolProfile:
@@ -41,18 +50,38 @@ class ProtocolProfile:
     full_config: str
     ip_address: str = ""
     quality_score: float = 0.0
+    speed_score: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.now)
     
     def get_unique_key(self) -> str:
         """Возвращает уникальный ключ на основе IP/домена и порта"""
         identifier = f"{self.ip_address or self.host}:{self.port}"
         return hashlib.md5(identifier.encode()).hexdigest()
+    
+    def generate_vless_config(self) -> str:
+        """Генерирует VLESS конфигурацию с 7-значным числом на конце"""
+        if self.protocol != 'vless':
+            return self.full_config
+        
+        random_suffix = random.randint(1000000, 9999999)
+        
+        # Парсим текущую конфигурацию
+        config_data = self.full_config.replace('vless://', '')
+        
+        # Добавляем случайное число к фрагменту
+        if '#' in config_data:
+            base_part, fragment = config_data.split('#', 1)
+            new_fragment = f"{fragment}-{random_suffix}"
+            return f"vless://{base_part}#{new_fragment}"
+        else:
+            return f"{self.full_config}-{random_suffix}"
 
 
 @dataclass
 class TelegramChannel:
     """Класс для хранения информации о Telegram-канале"""
-    username: str
+    username: str  # Сохраняем оригинальный регистр
     url: str
     profiles_count: int = 0
     quality_score: float = 0.0
@@ -61,26 +90,40 @@ class TelegramChannel:
     metadata: Dict[str, Any] = field(default_factory=dict)
     
     def get_unique_key(self) -> str:
-        """Возвращает уникальный ключ канала"""
+        """Возвращает уникальный ключ канала (нижний регистр для проверки дубликатов)"""
         return self.username.lower()
 
 
 class QualityEvaluator:
     """Многоуровневая система оценки качества каналов и профилей"""
     
-    # Веса для различных факторов оценки
-    WEIGHTS = {
-        'profile_count': 0.25,      # Количество профилей
-        'protocol_diversity': 0.20,  # Разнообразие протоколов
+    # Веса для различных факторов оценки каналов
+    CHANNEL_WEIGHTS = {
+        'profile_count': 0.30,      # Количество профилей
+        'protocol_diversity': 0.25,  # Разнообразие протоколов
         'update_frequency': 0.20,   # Частота обновлений
-        'config_validity': 0.20,    # Валидность конфигураций
-        'domain_reputation': 0.15   # Репутация домена
+        'config_validity': 0.15,    # Валидность конфигураций
+        'domain_reputation': 0.10   # Репутация домена
+    }
+    
+    # Веса для факторов оценки профилей
+    PROFILE_WEIGHTS = {
+        'base': 20.0,               # Базовая оценка
+        'ip_present': 10.0,         # Наличие IP
+        'standard_port': 10.0,      # Стандартный порт
+        'domain_reputation': 15.0,  # Репутация домена
+        'metadata': 15.0,           # Метаданные
+        'protocol_diversity': 15.0, # Разнообразие протоколов канала
+        'speed_bonus': 30.0         # Бонус за скорость
     }
     
     # Известные ненадежные домены
     SUSPICIOUS_DOMAINS = {
         'temp-mail.org', 'guerrillamail.com', 'mailinator.com'
     }
+    
+    # Стандартные порты
+    STANDARD_PORTS = {'443', '80', '8443', '8080', '22', '8443', '2053', '2083', '2087', '2096'}
     
     @classmethod
     def evaluate_channel(cls, channel: TelegramChannel, 
@@ -92,7 +135,10 @@ class QualityEvaluator:
         if channel.profiles_count > 0:
             import math
             max_profiles = max((c.profiles_count for c in all_channels), default=1)
-            scores['profile_count'] = math.log1p(channel.profiles_count) / math.log1p(max_profiles)
+            if max_profiles > 0:
+                scores['profile_count'] = math.log1p(channel.profiles_count) / math.log1p(max_profiles)
+            else:
+                scores['profile_count'] = 0
         else:
             scores['profile_count'] = 0
         
@@ -110,10 +156,10 @@ class QualityEvaluator:
         else:
             scores['update_frequency'] = 0.5
         
-        # Оценка валидности конфигураций (базовая)
+        # Оценка валидности конфигураций
         total_configs = sum(channel.protocols_found.values())
         if total_configs > 0:
-            scores['config_validity'] = min(total_configs / 100, 1.0)
+            scores['config_validity'] = min(total_configs / 50, 1.0)
         else:
             scores['config_validity'] = 0
         
@@ -125,34 +171,46 @@ class QualityEvaluator:
         # Итоговая оценка
         quality_score = sum(
             scores.get(key, 0) * weight 
-            for key, weight in cls.WEIGHTS.items()
+            for key, weight in cls.CHANNEL_WEIGHTS.items()
         )
         
         return round(quality_score * 100, 2)
     
     @classmethod
-    def evaluate_profile(cls, profile: ProtocolProfile) -> float:
-        """Оценивает качество профиля протокола"""
-        score = 50.0  # Базовая оценка
+    def evaluate_profile(cls, profile: ProtocolProfile, 
+                        channel_protocols: Optional[Dict[str, int]] = None) -> float:
+        """Оценивает качество профиля протокола с учетом скорости"""
+        score = cls.PROFILE_WEIGHTS['base']
         
         # Бонус за наличие IP
         if profile.ip_address:
-            score += 10
+            score += cls.PROFILE_WEIGHTS['ip_present']
         
         # Проверка порта (стандартные порты более надежны)
-        standard_ports = {'443', '80', '8443', '8080', '22'}
-        if profile.port in standard_ports:
-            score += 5
+        if profile.port in cls.STANDARD_PORTS:
+            score += cls.PROFILE_WEIGHTS['standard_port']
         
         # Проверка домена
         if profile.host and not any(
             susp in profile.host for susp in cls.SUSPICIOUS_DOMAINS
         ):
-            score += 10
+            score += cls.PROFILE_WEIGHTS['domain_reputation']
         
         # Бонус за метаданные
         if profile.metadata:
-            score += min(len(profile.metadata) * 2, 15)
+            score += min(len(profile.metadata) * 2, cls.PROFILE_WEIGHTS['metadata'])
+        
+        # Бонус за разнообразие протоколов в канале
+        if channel_protocols and len(channel_protocols) > 1:
+            score += min(len(channel_protocols) * 3, cls.PROFILE_WEIGHTS['protocol_diversity'])
+        
+        # Бонус за скорость (если есть данные о скорости)
+        if profile.speed_score > 0:
+            if profile.speed_score >= SPEED_THRESHOLD_KBPS:
+                score += cls.PROFILE_WEIGHTS['speed_bonus']
+            else:
+                # Пропорциональный бонус для slower скоростей
+                score += (profile.speed_score / SPEED_THRESHOLD_KBPS) * cls.PROFILE_WEIGHTS['speed_bonus']
         
         return min(round(score, 2), 100)
 
