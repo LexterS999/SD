@@ -1,27 +1,13 @@
 name: Парсер Telegram-каналов и протоколов
 
-on:
-  # Ручной запуск
+"on":
+  # Только ручной запуск
   workflow_dispatch:
     inputs:
       debug:
         description: 'Включить отладочный режим'
         required: false
         default: 'false'
-  
-  # Автоматический запуск каждые 3 часа
-  schedule:
-    - cron: '0 */3 * * *'  # Запуск в 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 UTC
-  
-  # Запуск при пуше в основную ветку (опционально)
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - 'parser.py'
-      - 'requirements.txt'
-      - 'input.txt'
 
 env:
   PYTHON_VERSION: '3.11'
@@ -106,18 +92,17 @@ jobs:
             echo "✓ Результаты закоммичены и отправлены в репозиторий"
           fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
       
       - name: Создание релиза с результатами (опционально)
-        if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: parser-run-${{ github.run_number }}
           name: Результаты парсера #${{ github.run_number }}
           body: |
-            ## Автоматический запуск парсера
+            ## Ручной запуск парсера
             
-            **Время запуска:** ${{ github.event.schedule }}
             **Дата:** $(date '+%Y-%m-%d %H:%M:%S')
             
             ### Статистика:
@@ -135,7 +120,7 @@ jobs:
             stats.json
           fail_on_error: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
   
   notify:
     name: Уведомление о завершении
