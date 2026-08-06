@@ -1,0 +1,15 @@
+{
+  "total_subscriptions": 23,
+  "total_channels": 3468,
+  "total_profiles": 46756,
+  "best_channels_count": 3468,
+  "bad_channels_count": 0,
+  "profiles_by_protocol": {
+    "vless": 41569,
+    "vmess": 1393,
+    "trojan": 3634,
+    "hy2": 159,
+    "ss": 1
+  },
+  "timestamp": "2026-08-06T11:10:11.994077"
+}

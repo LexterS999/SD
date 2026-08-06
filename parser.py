@@ -3,6 +3,17 @@
 Парсер Telegram-каналов и протоколов из внешних подписок
 Собирает профили VLESS, Trojan, SS, VMess, TUIC, HY2 из подписок и Telegram-каналов
 Оценивает качество каналов и профилей, удаляет дубликаты по IP/домену
+
+Требования:
+1. Файлы сохраняются в папке output: best_channels.txt, bad_channels.txt, protocols.txt
+2. best_channels.txt содержит только URL каналов
+3. Регистр телеграм-каналов сохраняется, дубликаты исключаются
+4. Разнообразная система скоринга для каналов и профилей
+5. Профили собираются за последние 7 дней, protocols.txt обновляется каждые 7 дней
+6. Проверка скорости через файл ~100KB (быстрый тест)
+7. Формат профилей с 7-значным суффиксом на конце (#PROTOCOL-xxxxxxx)
+8. Строгая дедупликация профилей - только уникальные конфигурации
+9. Только IPv4 адреса разрешены (домены и IPv6 отбрасываются)
 """
 
 import re
@@ -17,10 +28,10 @@ from typing import Dict, List, Set, Tuple, Optional, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
 import requests
-from bs4 import BeautifulSoup
 import asyncio
 import aiohttp
 import logging
+import time
 
 # Настройка логирования
 logging.basicConfig(
@@ -35,10 +46,62 @@ logger = logging.getLogger(__name__)
 
 # Константы
 OUTPUT_DIR = 'output'
-SPEED_TEST_URL = 'https://speed.hetzner.de/100MB.bin'  # Файл 100KB для теста скорости (используем меньший фрагмент)
-SPEED_THRESHOLD_KBPS = 300  # Порог скорости в КБ/с для бонусных баллов
-PROFILE_LIFETIME_DAYS = 7  # Срок жизни профилей в днях
-BAD_CHANNELS_THRESHOLD = 20  # Порог качества для bad_channels.txt
+
+# Импорт настроек из config.py
+try:
+    import config
+    SPEED_TEST_URL = getattr(config, 'SPEED_TEST_URL', 'https://proof.ovh.net/files/100Ko.dat')
+    SPEED_THRESHOLD_KBPS = getattr(config, 'SPEED_THRESHOLD_KBPS', 300)
+    PROFILE_LIFETIME_DAYS = getattr(config, 'PROFILE_LIFETIME_DAYS', 7)
+    BAD_CHANNELS_THRESHOLD = getattr(config, 'BAD_CHANNELS_THRESHOLD', 20)
+    ALLOW_ONLY_IPV4 = getattr(config, 'ALLOW_ONLY_IPV4', True)
+    BLOCK_IPV6_DOMAINS = getattr(config, 'BLOCK_IPV6_DOMAINS', True)
+    ENABLE_STRICT_DEDUPLICATION = getattr(config, 'ENABLE_STRICT_DEDUPLICATION', True)
+except ImportError:
+    # Значения по умолчанию, если config.py не найден
+    SPEED_TEST_URL = 'https://proof.ovh.net/files/100Ko.dat'  # Файл ~100KB для теста скорости
+    SPEED_THRESHOLD_KBPS = 300
+    PROFILE_LIFETIME_DAYS = 7
+    BAD_CHANNELS_THRESHOLD = 20
+    ALLOW_ONLY_IPV4 = True
+    BLOCK_IPV6_DOMAINS = True
+    ENABLE_STRICT_DEDUPLICATION = True
+
+PROTOCOLS_FILE = os.path.join(OUTPUT_DIR, 'protocols.txt')
+BEST_CHANNELS_FILE = os.path.join(OUTPUT_DIR, 'best_channels.txt')
+BAD_CHANNELS_FILE = os.path.join(OUTPUT_DIR, 'bad_channels.txt')
+
+
+def is_valid_ipv4(address: str) -> bool:
+    """Проверяет, является ли адрес действительным IPv4 адресом"""
+    if not address:
+        return False
+    
+    # Проверяем, что это не доменное имя (содержит буквы)
+    if re.match(r'^[a-zA-Z]', address):
+        return False
+    
+    # Проверяем, что это не IPv6 (содержит двоеточия)
+    if ':' in address:
+        return False
+    
+    # Проверяем формат IPv4
+    parts = address.split('.')
+    if len(parts) != 4:
+        return False
+    
+    for part in parts:
+        try:
+            num = int(part)
+            if num < 0 or num > 255:
+                return False
+            # Проверяем, что часть не содержит ведущих нулей (кроме "0")
+            if part != str(num):
+                return False
+        except ValueError:
+            return False
+    
+    return True
 
 
 @dataclass
@@ -50,32 +113,35 @@ class ProtocolProfile:
     full_config: str
     ip_address: str = ""
     quality_score: float = 0.0
-    speed_score: float = 0.0
+    speed_kbps: float = 0.0  # Скорость в КБ/с
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
+    source_channel: str = ""
     
-    def get_unique_key(self) -> str:
-        """Возвращает уникальный ключ на основе IP/домена и порта"""
+    def get_config_hash(self) -> str:
+        """Возвращает хеш полной конфигурации для строгой дедупликации"""
+        # Удаляем любые существующие суффиксы перед хешированием
+        config_clean = self.full_config
+        if '#' in config_clean:
+            config_clean = config_clean.rsplit('#', 1)[0]
+        return hashlib.sha256(config_clean.encode()).hexdigest()
+    
+    def get_ip_port_key(self) -> str:
+        """Возвращает ключ на основе IP и порта"""
         identifier = f"{self.ip_address or self.host}:{self.port}"
         return hashlib.md5(identifier.encode()).hexdigest()
     
-    def generate_vless_config(self) -> str:
-        """Генерирует VLESS конфигурацию с 7-значным числом на конце"""
-        if self.protocol != 'vless':
-            return self.full_config
+    def generate_config_with_suffix(self) -> str:
+        """Генерирует конфигурацию с 7-значным случайным суффиксом на конце в формате #PROTOCOL-xxxxxxx"""
+        random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=7))
+        protocol_prefix = self.protocol.upper()
         
-        random_suffix = random.randint(1000000, 9999999)
-        
-        # Парсим текущую конфигурацию
-        config_data = self.full_config.replace('vless://', '')
-        
-        # Добавляем случайное число к фрагменту
-        if '#' in config_data:
-            base_part, fragment = config_data.split('#', 1)
-            new_fragment = f"{fragment}-{random_suffix}"
-            return f"vless://{base_part}#{new_fragment}"
+        # Всегда заменяем или добавляем фрагмент в формате #PROTOCOL-xxxxxxx
+        if '#' in self.full_config:
+            base_part, _ = self.full_config.rsplit('#', 1)
+            return f"{base_part}#{protocol_prefix}-{random_suffix}"
         else:
-            return f"{self.full_config}-{random_suffix}"
+            return f"{self.full_config}#{protocol_prefix}-{random_suffix}"
 
 
 @dataclass
@@ -205,12 +271,13 @@ class QualityEvaluator:
             score += min(len(channel_protocols) * 3, cls.PROFILE_WEIGHTS['protocol_diversity'])
         
         # Бонус за скорость (если есть данные о скорости)
-        if profile.speed_score > 0:
-            if profile.speed_score >= SPEED_THRESHOLD_KBPS:
+        # Профили со скоростью выше 300 КБ/с получают максимальный бонус
+        if profile.speed_kbps > 0:
+            if profile.speed_kbps >= SPEED_THRESHOLD_KBPS:
                 score += cls.PROFILE_WEIGHTS['speed_bonus']
             else:
-                # Пропорциональный бонус для slower скоростей
-                score += (profile.speed_score / SPEED_THRESHOLD_KBPS) * cls.PROFILE_WEIGHTS['speed_bonus']
+                # Пропорциональный бонус для меньших скоростей
+                score += (profile.speed_kbps / SPEED_THRESHOLD_KBPS) * cls.PROFILE_WEIGHTS['speed_bonus']
         
         return min(round(score, 2), 100)
 
@@ -239,8 +306,8 @@ class ProtocolParser:
     ]
     
     @classmethod
-    def extract_protocols(cls, text: str) -> List[ProtocolProfile]:
-        """Извлекает все протоколы из текста"""
+    def extract_protocols(cls, text: str, source_channel: str = "") -> List[ProtocolProfile]:
+        """Извлекает все протоколы из текста с проверкой на IPv4"""
         profiles = []
         
         for protocol, pattern in cls.PROTOCOL_PATTERNS.items():
@@ -249,6 +316,17 @@ class ProtocolParser:
                 try:
                     profile = cls.parse_protocol(match, protocol)
                     if profile:
+                        profile.source_channel = source_channel
+                        # Проверка на IPv4 если включена настройка ALLOW_ONLY_IPV4
+                        if ALLOW_ONLY_IPV4:
+                            # Получаем IP адрес из профиля
+                            ip_to_check = profile.ip_address or profile.host
+                            
+                            # Проверяем, является ли адрес действительным IPv4
+                            if not is_valid_ipv4(ip_to_check):
+                                logger.debug(f"Отклонен профиль (не IPv4): {ip_to_check}")
+                                continue
+                        
                         profiles.append(profile)
                 except Exception as e:
                     logger.debug(f"Ошибка при парсинге {protocol}: {e}")
@@ -256,9 +334,9 @@ class ProtocolParser:
         return profiles
     
     @classmethod
-    def extract_telegram_channels(cls, text: str) -> Set[str]:
-        """Извлекает Telegram-каналы из текста"""
-        channels = set()
+    def extract_telegram_channels(cls, text: str) -> Dict[str, str]:
+        """Извлекает Telegram-каналы из текста с сохранением регистра"""
+        channels = {}  # lower_username -> original_username
         
         for pattern in cls.TG_PATTERNS:
             matches = re.findall(pattern, text, re.IGNORECASE)
@@ -266,7 +344,10 @@ class ProtocolParser:
                 # Очищаем username
                 username = match.strip().lstrip('@').lstrip('+')
                 if len(username) >= 5:
-                    channels.add(username.lower())
+                    # Сохраняем первый найденный вариант (оригинальный регистр)
+                    lower_key = username.lower()
+                    if lower_key not in channels:
+                        channels[lower_key] = username
         
         return channels
     
@@ -330,16 +411,9 @@ class ProtocolParser:
         try:
             config_data = config.replace('vless://', '')
             
-            # Парсим URL
-            if '#' in config_data:
-                config_part, fragment = config_data.split('#', 1)
-            else:
-                config_part = config_data
-                fragment = ''
-            
             # UUID@host:port
-            if '@' in config_part:
-                uuid_part, rest = config_part.split('@', 1)
+            if '@' in config_data:
+                uuid_part, rest = config_data.split('@', 1)
                 
                 if ':' in rest:
                     host_port = rest.split('?')[0]
@@ -359,8 +433,7 @@ class ProtocolParser:
                         ip_address=host,
                         metadata={
                             'uuid': uuid_part,
-                            'params': {k: v[0] if v else '' for k, v in params.items()},
-                            'fragment': fragment
+                            'params': {k: v[0] if v else '' for k, v in params.items()}
                         }
                     )
             
@@ -410,23 +483,25 @@ class ProtocolParser:
         try:
             config_data = config.replace('ss://', '')
             
-            # Пробуем декодировать base64 часть
+            # Пробуем разные форматы
+            # Формат 1: base64(method:password)@host:port
             if '@' in config_data:
-                encoded_part, rest = config_data.split('@', 1)
+                auth_host, rest = config_data.split('@', 1)
+                
+                # Декодируем base64 часть
                 try:
-                    decoded = base64.b64decode(encoded_part).decode('utf-8')
-                    if ':' in decoded:
-                        method_password, host_port = decoded.rsplit('@', 1)
-                        host, port = host_port.rsplit(':', 1)
-                        
-                        return ProtocolProfile(
-                            protocol='ss',
-                            host=host,
-                            port=port,
-                            full_config=config,
-                            ip_address=host,
-                            metadata={'method_password': method_password}
-                        )
+                    decoded = base64.b64decode(auth_host).decode('utf-8')
+                    method_password, host_port = decoded.split('@', 1)
+                    host, port = host_port.rsplit(':', 1)
+                    
+                    return ProtocolProfile(
+                        protocol='ss',
+                        host=host,
+                        port=port,
+                        full_config=config,
+                        ip_address=host,
+                        metadata={'method_password': method_password}
+                    )
                 except:
                     pass
             
@@ -516,6 +591,24 @@ class SubscriptionFetcher:
     }
     
     @classmethod
+    async def test_speed(cls, session: aiohttp.ClientSession, host: str) -> float:
+        """Тестирует скорость подключения к хосту через файл ~100KB"""
+        try:
+            # Используем тестовый файл ~100KB для быстрой проверки
+            start_time = time.time()
+            async with session.get(SPEED_TEST_URL, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.read()
+                    elapsed = time.time() - start_time
+                    # Вычисляем скорость в КБ/с
+                    size_kb = len(data) / 1024
+                    speed_kbps = size_kb / elapsed if elapsed > 0 else 0
+                    return round(speed_kbps, 2)
+        except Exception as e:
+            logger.debug(f"Тест скорости не удался: {e}")
+        return 0.0
+    
+    @classmethod
     async def fetch_url(cls, session: aiohttp.ClientSession, url: str) -> Optional[str]:
         """Получает содержимое URL"""
         try:
@@ -559,7 +652,6 @@ class TelegramChannelFetcher:
     # Публичные API для получения сообщений из Telegram-каналов
     TG_API_ENDPOINTS = [
         'https://tg.i-c-a.su/r/{channel}/{limit}',
-        'https://api.telegram.org/s/{channel}',
     ]
     
     @classmethod
@@ -571,6 +663,7 @@ class TelegramChannelFetcher:
     ) -> List[str]:
         """Получает сообщения из Telegram-канала за последние N дней"""
         messages = []
+        cutoff_date = datetime.now() - timedelta(days=days)
         
         try:
             # Пробуем разные эндпоинты
@@ -584,19 +677,22 @@ class TelegramChannelFetcher:
                             # Обрабатываем ответ в зависимости от формата API
                             if isinstance(data, list):
                                 for msg in data:
-                                    if isinstance(msg, dict) and 'text' in msg:
-                                        messages.append(msg['text'])
-                            elif isinstance(data, dict):
-                                if 'messages' in data:
-                                    for msg in data['messages']:
-                                        if isinstance(msg, dict) and 'text' in msg:
-                                            messages.append(msg['text'])
-                                elif 'result' in data:
-                                    # Telegram Bot API формат
-                                    pass
+                                    if isinstance(msg, dict):
+                                        # Проверяем дату сообщения
+                                        msg_date = None
+                                        if 'date' in msg:
+                                            try:
+                                                msg_date = datetime.fromtimestamp(msg['date'])
+                                            except:
+                                                pass
+                                        
+                                        # Добавляем только сообщения за последние N дней
+                                        if msg_date is None or msg_date >= cutoff_date:
+                                            if 'text' in msg:
+                                                messages.append(msg['text'])
                             
                             if messages:
-                                logger.info(f"Получено {len(messages)} сообщений из @{channel}")
+                                logger.info(f"Получено {len(messages)} сообщений из @{channel} за последние {days} дней")
                                 break
                 except Exception as e:
                     logger.debug(f"Ошибка при получении @{channel}: {e}")
@@ -608,6 +704,39 @@ class TelegramChannelFetcher:
         return messages
 
 
+class ProfileDeduplicator:
+    """Класс для строгой дедупликации профилей"""
+    
+    def __init__(self):
+        self.config_hashes: Set[str] = set()  # Хеш полной конфигурации
+        self.ip_port_keys: Set[str] = set()  # Ключи IP:port
+    
+    def is_duplicate(self, profile: ProtocolProfile) -> bool:
+        """Проверяет, является ли профиль дубликатом"""
+        if not ENABLE_STRICT_DEDUPLICATION:
+            return False
+        
+        # Получаем хеш конфигурации
+        config_hash = profile.get_config_hash()
+        
+        # Проверяем по хешу конфигурации
+        if config_hash in self.config_hashes:
+            logger.debug(f"Дубликат конфигурации: {profile.protocol}://{profile.host}:{profile.port}")
+            return True
+        
+        # Проверяем по IP:port
+        ip_port_key = profile.get_ip_port_key()
+        if ip_port_key in self.ip_port_keys:
+            logger.debug(f"Дубликат IP:port: {profile.ip_address or profile.host}:{profile.port}")
+            return True
+        
+        # Добавляем в множества
+        self.config_hashes.add(config_hash)
+        self.ip_port_keys.add(ip_port_key)
+        
+        return False
+
+
 class Parser:
     """Основной класс парсера"""
     
@@ -616,7 +745,7 @@ class Parser:
         self.subscriptions: Dict[str, str] = {}
         self.channels: Dict[str, TelegramChannel] = {}
         self.profiles: Dict[str, ProtocolProfile] = {}
-        self.seen_hosts: Set[str] = set()
+        self.deduplicator = ProfileDeduplicator()
     
     def load_subscriptions(self) -> List[str]:
         """Загружает список подписок из файла"""
@@ -649,26 +778,27 @@ class Parser:
             # Извлечение протоколов
             profiles = ProtocolParser.extract_protocols(content)
             for profile in profiles:
-                unique_key = profile.get_unique_key()
-                if unique_key not in self.profiles:
+                # Строгая проверка на дубликаты
+                if not self.deduplicator.is_duplicate(profile):
                     profile.quality_score = QualityEvaluator.evaluate_profile(profile)
+                    unique_key = profile.get_config_hash()
                     self.profiles[unique_key] = profile
             
-            # Извлечение Telegram-каналов
-            tg_channels = ProtocolParser.extract_telegram_channels(content)
-            for channel_username in tg_channels:
-                if channel_username not in self.channels:
-                    self.channels[channel_username] = TelegramChannel(
-                        username=channel_username,
-                        url=f"https://t.me/{channel_username}"
+            # Извлечение Telegram-каналов с сохранением регистра
+            tg_channels_dict = ProtocolParser.extract_telegram_channels(content)
+            for lower_key, original_username in tg_channels_dict.items():
+                if lower_key not in self.channels:
+                    self.channels[lower_key] = TelegramChannel(
+                        username=original_username,  # Сохраняем оригинальный регистр
+                        url=f"https://t.me/{original_username}"
                     )
         
         logger.info(f"Найдено {len(self.channels)} Telegram-каналов")
-        logger.info(f"Найдено {len(self.profiles)} уникальных профилей")
+        logger.info(f"Найдено {len(self.profiles)} уникальных профилей после дедупликации")
         
-        # Второй проход: получение данных из Telegram-каналов
+        # Второй проход: получение данных из Telegram-каналов (только за последние 7 дней)
         if self.channels:
-            logger.info("Получение данных из Telegram-каналов...")
+            logger.info("Получение данных из Telegram-каналов (только за последние 7 дней)...")
             await self.process_telegram_channels()
         
         # Оценка качества каналов
@@ -682,7 +812,7 @@ class Parser:
         logger.info("Процесс завершен")
     
     async def process_telegram_channels(self):
-        """Обрабатывает Telegram-каналы и извлекает протоколы"""
+        """Обрабатывает Telegram-каналы и извлекает протоколы только за последние 7 дней"""
         async with aiohttp.ClientSession() as session:
             tasks = []
             for channel in self.channels.values():
@@ -690,7 +820,7 @@ class Parser:
                     TelegramChannelFetcher.fetch_channel_messages(
                         session, 
                         channel.username,
-                        days=7
+                        days=PROFILE_LIFETIME_DAYS  # Только за последние 7 дней
                     )
                 )
             
@@ -701,11 +831,12 @@ class Parser:
                     all_text = '\n'.join(str(m) for m in messages if m)
                     
                     # Извлечение протоколов из сообщений
-                    profiles = ProtocolParser.extract_protocols(all_text)
+                    profiles = ProtocolParser.extract_protocols(all_text, channel.username)
                     for profile in profiles:
-                        unique_key = profile.get_unique_key()
-                        if unique_key not in self.profiles:
+                        # Строгая проверка на дубликаты
+                        if not self.deduplicator.is_duplicate(profile):
                             profile.quality_score = QualityEvaluator.evaluate_profile(profile)
+                            unique_key = profile.get_config_hash()
                             self.profiles[unique_key] = profile
                         
                         # Обновление статистики канала
@@ -726,25 +857,38 @@ class Parser:
             )
     
     def save_results(self):
-        """Сохраняет результаты в файлы"""
-        # Сортировка профилей по качеству
+        """Сохраняет результаты в файлы в папке output"""
+        # Создаем папку output если не существует
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        
+        # Сортировка профилей по качеству (сначала лучшие)
         sorted_profiles = sorted(
             self.profiles.values(),
             key=lambda p: p.quality_score,
             reverse=True
         )
         
-        # Сохранение профилей
-        with open('protocols.txt', 'w', encoding='utf-8') as f:
+        # Проверка возраста protocols.txt - если старше 7 дней, очищаем
+        protocols_need_refresh = True
+        if os.path.exists(PROTOCOLS_FILE):
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(PROTOCOLS_FILE))
+            if (datetime.now() - file_mtime).days < PROFILE_LIFETIME_DAYS:
+                protocols_need_refresh = False
+        
+        # Сохранение профилей в protocols.txt с новым форматом
+        with open(PROTOCOLS_FILE, 'w', encoding='utf-8') as f:
             f.write("# Уникальные профили протоколов, отсортированные по качеству\n")
             f.write(f"# Всего профилей: {len(sorted_profiles)}\n")
             f.write(f"# Дата генерации: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Срок жизни профилей: {PROFILE_LIFETIME_DAYS} дней\n")
             f.write("#\n")
-            f.write("# Формат: [Качество: XX.XX] протокол://конфигурация\n")
+            f.write("# Формат: протокол://конфигурация#PROTOCOL-random_suffix\n")
             f.write("#\n\n")
             
             for i, profile in enumerate(sorted_profiles, 1):
-                f.write(f"[{i}] [Quality: {profile.quality_score:.2f}] {profile.full_config}\n")
+                # Генерируем конфигурацию с 7-значным числом на конце
+                config_with_suffix = profile.generate_config_with_suffix()
+                f.write(f"{config_with_suffix}\n")
         
         # Сортировка каналов по качеству
         sorted_channels = sorted(
@@ -753,32 +897,31 @@ class Parser:
             reverse=True
         )
         
-        # Сохранение каналов
-        with open('best_channels.txt', 'w', encoding='utf-8') as f:
-            f.write("# Лучшие Telegram-каналы, отсортированные по качеству\n")
-            f.write(f"# Всего каналов: {len(sorted_channels)}\n")
+        # Разделяем каналы на лучшие и плохие
+        best_channels = [c for c in sorted_channels if c.quality_score >= BAD_CHANNELS_THRESHOLD]
+        bad_channels = [c for c in sorted_channels if c.quality_score < BAD_CHANNELS_THRESHOLD]
+        
+        # Сохранение лучших каналов - ТОЛЬКО URL
+        with open(BEST_CHANNELS_FILE, 'w', encoding='utf-8') as f:
+            for channel in best_channels:
+                f.write(f"{channel.url}\n")
+        
+        # Сохранение плохих каналов
+        with open(BAD_CHANNELS_FILE, 'w', encoding='utf-8') as f:
+            f.write("# Плохие Telegram-каналы (quality < 20)\n")
+            f.write(f"# Всего каналов: {len(bad_channels)}\n")
             f.write(f"# Дата генерации: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("#\n")
-            f.write("# Формат: [Качество: XX.XX] @username - Профилей: N - Протоколы: ...\n")
             f.write("#\n\n")
-            
-            for i, channel in enumerate(sorted_channels, 1):
-                protocols_str = ', '.join(
-                    f"{proto}: {count}" 
-                    for proto, count in channel.protocols_found.items()
-                )
-                f.write(
-                    f"[{i}] [Quality: {channel.quality_score:.2f}] "
-                    f"@{channel.username} - Профилей: {channel.profiles_count} - "
-                    f"Протоколы: {protocols_str or 'нет данных'}\n"
-                    f"    URL: {channel.url}\n\n"
-                )
+            for channel in bad_channels:
+                f.write(f"{channel.url}\n")
         
         # Сохранение статистики
         stats = {
             'total_subscriptions': len(self.subscriptions),
             'total_channels': len(self.channels),
             'total_profiles': len(self.profiles),
+            'best_channels_count': len(best_channels),
+            'bad_channels_count': len(bad_channels),
             'profiles_by_protocol': defaultdict(int),
             'timestamp': datetime.now().isoformat()
         }
@@ -786,11 +929,13 @@ class Parser:
         for profile in self.profiles.values():
             stats['profiles_by_protocol'][profile.protocol] += 1
         
-        with open('stats.json', 'w', encoding='utf-8') as f:
-            json.dump(stats, f, indent=2, ensure_ascii=False)
+        stats_file = os.path.join(OUTPUT_DIR, 'stats.json')
+        with open(stats_file, 'w', encoding='utf-8') as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False, default=str)
         
-        logger.info(f"Сохранено {len(sorted_profiles)} профилей в protocols.txt")
-        logger.info(f"Сохранено {len(sorted_channels)} каналов в best_channels.txt")
+        logger.info(f"Сохранено {len(sorted_profiles)} профилей в {PROTOCOLS_FILE}")
+        logger.info(f"Сохранено {len(best_channels)} лучших каналов в {BEST_CHANNELS_FILE}")
+        logger.info(f"Сохранено {len(bad_channels)} плохих каналов в {BAD_CHANNELS_FILE}")
 
 
 async def main():
