@@ -1,6 +1,6 @@
 name: Парсер Telegram-каналов и протоколов
 
-"on":
+on:
   # Только ручной запуск
   workflow_dispatch:
     inputs:
@@ -8,6 +8,9 @@ name: Парсер Telegram-каналов и протоколов
         description: 'Включить отладочный режим'
         required: false
         default: 'false'
+
+permissions:
+  contents: write
 
 env:
   PYTHON_VERSION: '3.11'
@@ -88,11 +91,12 @@ jobs:
           else
             TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
             git commit -m "🔄 Обновление результатов парсера от ${TIMESTAMP} [skip ci]"
+            
+            # Настраиваем URL репозитория для использования токена
+            git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
             git push
             echo "✓ Результаты закоммичены и отправлены в репозиторий"
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
       
       - name: Создание релиза с результатами (опционально)
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
