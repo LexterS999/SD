@@ -1,0 +1,156 @@
+name: Парсер Telegram-каналов и протоколов
+
+on:
+  # Ручной запуск
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Включить отладочный режим'
+        required: false
+        default: 'false'
+  
+  # Автоматический запуск каждые 3 часа
+  schedule:
+    - cron: '0 */3 * * *'  # Запуск в 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 UTC
+  
+  # Запуск при пуше в основную ветку (опционально)
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'parser.py'
+      - 'requirements.txt'
+      - 'input.txt'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  parse-subscriptions:
+    name: Парсинг подписок и Telegram-каналов
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout репозитория
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      - name: Настройка Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Проверка входных данных
+        run: |
+          if [ ! -f input.txt ]; then
+            echo "Ошибка: файл input.txt не найден!"
+            exit 1
+          fi
+          echo "Найдено $(wc -l < input.txt) подписок для обработки"
+      
+      - name: Запуск парсера
+        run: |
+          echo "Запуск парсера..."
+          python parser.py
+          
+          # Проверка результатов
+          if [ -f protocols.txt ]; then
+            echo "✓ Файл protocols.txt создан"
+            echo "  Количество профилей: $(grep -c '^\[' protocols.txt || echo 0)"
+          else
+            echo "✗ Файл protocols.txt не создан"
+          fi
+          
+          if [ -f best_channels.txt ]; then
+            echo "✓ Файл best_channels.txt создан"
+            echo "  Количество каналов: $(grep -c '^\[' best_channels.txt || echo 0)"
+          else
+            echo "✗ Файл best_channels.txt не создан"
+          fi
+      
+      - name: Сохранение артефактов
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-results
+          path: |
+            protocols.txt
+            best_channels.txt
+            stats.json
+            parser.log
+          retention-days: 30
+          if-no-files-found: warn
+      
+      - name: Коммит и пуш результатов (опционально)
+        run: |
+          git config --global user.name 'GitHub Actions Bot'
+          git config --global user.email 'actions@github.com'
+          
+          # Добавляем файлы результатов
+          git add protocols.txt best_channels.txt stats.json 2>/dev/null || true
+          
+          # Проверяем есть ли изменения
+          if git diff --staged --quiet; then
+            echo "Нет изменений для коммита"
+          else
+            TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+            git commit -m "🔄 Обновление результатов парсера от ${TIMESTAMP} [skip ci]"
+            git push
+            echo "✓ Результаты закоммичены и отправлены в репозиторий"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Создание релиза с результатами (опционально)
+        if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: parser-run-${{ github.run_number }}
+          name: Результаты парсера #${{ github.run_number }}
+          body: |
+            ## Автоматический запуск парсера
+            
+            **Время запуска:** ${{ github.event.schedule }}
+            **Дата:** $(date '+%Y-%m-%d %H:%M:%S')
+            
+            ### Статистика:
+            - Обработано подписок: $(cat stats.json 2>/dev/null | grep total_subscriptions | grep -o '[0-9]*' || echo "N/A")
+            - Найдено каналов: $(cat stats.json 2>/dev/null | grep total_channels | grep -o '[0-9]*' || echo "N/A")
+            - Найдено профилей: $(cat stats.json 2>/dev/null | grep total_profiles | grep -o '[0-9]*' || echo "N/A")
+            
+            ### Файлы:
+            - `protocols.txt` - Уникальные профили протоколов
+            - `best_channels.txt` - Лучшие Telegram-каналы
+            - `stats.json` - Статистика запуска
+          files: |
+            protocols.txt
+            best_channels.txt
+            stats.json
+          fail_on_error: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  
+  notify:
+    name: Уведомление о завершении
+    runs-on: ubuntu-latest
+    needs: parse-subscriptions
+    if: always()
+    
+    steps:
+      - name: Статус выполнения
+        run: |
+          if [ "${{ needs.parse-subscriptions.result }}" == "success" ]; then
+            echo "✅ Парсинг успешно завершен"
+          elif [ "${{ needs.parse-subscriptions.result }}" == "failure" ]; then
+            echo "❌ Парсинг завершился с ошибкой"
+            exit 1
+          else
+            echo "⚠️ Парсинг был пропущен или отменен"
+          fi
