@@ -1,4 +1,5 @@
-# Плохие Telegram-каналы (quality_score < 20.0)
-# Дата генерации: 2026-08-07T10:04:18Z
+# Плохие Telegram-каналы (не прошли порог quality_score < 20.0)
+# Период сбора данных: 14 дн.
+# Дата генерации: 2026-08-07T12:13:52Z
 # Формат: URL канала | quality_score | profiles_count | protocols_found
 
