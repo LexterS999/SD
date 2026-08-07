@@ -12,7 +12,7 @@
 6. Разрешает только endpoint'ы с IPv4.
 7. Ведёт 7-дневный реестр profiles/protocols без дублей.
 8. После истечения 7 дней полностью сбрасывает реестр.
-9. Выполняет быструю speed-оценку для каждого профиля.
+9. Выполняет TCP RTT проверку для каждого профиля (фильтрация по максимальному RTT).
 10. Сохраняет protocols.txt, best_channels.txt, bad_channels.txt, stats.json.
 """
 
@@ -117,6 +117,57 @@ def _dedup_get_host_port(uri):
     return None
 
 
+def light_deduplicate(profiles):
+    """Легкая дедупликация - только по каноническому ключу."""
+    initial_count = len(profiles)
+    logger.info(f"Запуск легкой дедупликации. Исходное количество: {initial_count}")
+
+    unique_profiles = {}
+    for p in profiles:
+        key = _dedup_normalize_profile(p)
+        if not key:
+            continue
+        if key not in unique_profiles:
+            unique_profiles[key] = p
+
+    final_profiles = list(unique_profiles.values())
+    final_count = len(final_profiles)
+    logger.info(f"Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
+
+    return final_profiles
+
+
+def medium_deduplicate(profiles):
+    """Средняя дедупликация - по каноническому ключу и identity_key."""
+    initial_count = len(profiles)
+    logger.info(f"Запуск средней дедупликации. Исходное количество: {initial_count}")
+
+    unique_profiles = {}
+    seen_identity = set()
+    for p in profiles:
+        key = _dedup_normalize_profile(p)
+        if not key:
+            continue
+        if key in unique_profiles:
+            continue
+        # Извлекаем identity из профиля для дополнительной проверки
+        try:
+            parsed = urlparse(p.split('#')[0])
+            identity = f"{parsed.scheme.lower()}|{parsed.hostname}|{parsed.port}"
+            if identity in seen_identity:
+                continue
+            seen_identity.add(identity)
+        except Exception:
+            pass
+        unique_profiles[key] = p
+
+    final_profiles = list(unique_profiles.values())
+    final_count = len(final_profiles)
+    logger.info(f"Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
+
+    return final_profiles
+
+
 def aggressive_deduplicate(profiles):
     """Применяет все возможные фильтры для сокращения объема профилей."""
     initial_count = len(profiles)
@@ -149,6 +200,22 @@ def aggressive_deduplicate(profiles):
     return final_profiles
 
 
+def apply_deduplication(profiles, dedup_level):
+    """Применяет дедупликацию в зависимости от уровня."""
+    if dedup_level == 'off':
+        logger.info("Дедупликация отключена")
+        return profiles
+    elif dedup_level == 'light':
+        return light_deduplicate(profiles)
+    elif dedup_level == 'medium':
+        return medium_deduplicate(profiles)
+    elif dedup_level == 'aggressive':
+        return aggressive_deduplicate(profiles)
+    else:
+        logger.warning(f"Неизвестный уровень дедупликации '{dedup_level}', используется medium")
+        return medium_deduplicate(profiles)
+
+
 # =============================================================================
 # НАСТРОЙКИ
 # =============================================================================
@@ -164,8 +231,10 @@ OUTPUT_ENCODING = cfg('OUTPUT_ENCODING', 'utf-8')
 LOG_LEVEL = cfg('LOG_LEVEL', 'INFO')
 LOG_FILE = cfg('LOG_FILE', 'parser.log')
 
-PROFILE_WINDOW_DAYS = int(cfg('PROFILE_WINDOW_DAYS', 7))
-CHANNEL_WINDOW_DAYS = int(cfg('CHANNEL_WINDOW_DAYS', 7))
+# Период сбора данных (в днях) - может быть задан через переменную окружения COLLECTION_PERIOD_DAYS
+COLLECTION_PERIOD_DAYS = int(cfg('COLLECTION_PERIOD_DAYS', os.environ.get('COLLECTION_PERIOD_DAYS', '7')))
+PROFILE_WINDOW_DAYS = int(cfg('PROFILE_WINDOW_DAYS', COLLECTION_PERIOD_DAYS))
+CHANNEL_WINDOW_DAYS = int(cfg('CHANNEL_WINDOW_DAYS', COLLECTION_PERIOD_DAYS))
 REGISTRY_RESET_DAYS = int(cfg('REGISTRY_RESET_DAYS', 7))
 MERGE_WITH_PREVIOUS_REGISTRY = bool(cfg('MERGE_WITH_PREVIOUS_REGISTRY', True))
 
@@ -179,29 +248,17 @@ CHANNELS_STATE_FILE_NAME = cfg('CHANNELS_STATE_FILE', 'channels_state.json')
 USER_AGENT = cfg('USER_AGENT', 'Mozilla/5.0')
 SUBSCRIPTION_FETCH_TIMEOUT = float(cfg('SUBSCRIPTION_FETCH_TIMEOUT', 25))
 TELEGRAM_FETCH_TIMEOUT = float(cfg('TELEGRAM_FETCH_TIMEOUT', 12))
-SPEED_TEST_TIMEOUT = float(cfg('SPEED_TEST_TIMEOUT', 2.5))
+TCP_CHECK_TIMEOUT = float(cfg('TCP_CHECK_TIMEOUT', 3.0))
 MAX_CONCURRENT_SUBSCRIPTION_FETCHES = int(cfg('MAX_CONCURRENT_SUBSCRIPTION_FETCHES', 20))
 MAX_CONCURRENT_TELEGRAM_FETCHES = int(cfg('MAX_CONCURRENT_TELEGRAM_FETCHES', 40))
-MAX_CONCURRENT_SPEED_TESTS = int(cfg('MAX_CONCURRENT_SPEED_TESTS', 150))
+MAX_CONCURRENT_TCP_CHECKS = int(cfg('MAX_CONCURRENT_TCP_CHECKS', 150))
 TELEGRAM_MESSAGES_LIMIT = int(cfg('TELEGRAM_MESSAGES_LIMIT', 100))
 TELEGRAM_WEB_PREVIEW_ENABLED = bool(cfg('TELEGRAM_WEB_PREVIEW_ENABLED', True))
 TELEGRAM_WEB_PREVIEW_MAX_PAGES = int(cfg('TELEGRAM_WEB_PREVIEW_MAX_PAGES', 3))
 
-SPEED_TEST_URL = cfg('SPEED_TEST_URL', 'https://www.thinkbroadband.com/download/thinkbroadband_100k.bin')
-SPEED_TEST_FILE_SIZE_BYTES = int(cfg('SPEED_TEST_FILE_SIZE_BYTES', 102400))
-SPEED_THRESHOLD_KBPS = float(cfg('SPEED_THRESHOLD_KBPS', os.environ.get('SPEED_THRESHOLD_KBPS', '300')))
-MAX_REPORTED_SPEED_KBPS = float(cfg('MAX_REPORTED_SPEED_KBPS', 5000.0))
-SPEED_TEST_STRATEGY = str(cfg('SPEED_TEST_STRATEGY', 'tcp_probe')).strip().lower()
-MIN_BASE_SCORE_FOR_SPEED_PRIORITY = float(cfg('MIN_BASE_SCORE_FOR_SPEED_PRIORITY', 45.0))
-SPEED_TEST_TOTAL_BUDGET_SECONDS = float(cfg('SPEED_TEST_TOTAL_BUDGET_SECONDS', 240.0))
-
-# Список URL для эталонного speed-теста (разные размеры 150-200KB для предотвращения бана)
-SPEED_TEST_FALLBACK_URLS_DEFAULT = [
-    'https://www.thinkbroadband.com/download/thinkbroadband_100k.bin',
-    'https://proof.ovh.net/files/128Mb.dat',
-    'https://speed.hetzner.de/cloud/scale-small.bin',
-    'https://ipv4.download.thinkbroadband.com/200MB.zip',
-]
+# Настройки TCP RTT проверки
+TCP_RTT_MAX_MS = float(cfg('TCP_RTT_MAX_MS', os.environ.get('TCP_RTT_MAX_MS', '500')))
+TCP_CHECK_ENABLED = bool(cfg('TCP_CHECK_ENABLED', os.environ.get('TCP_CHECK_ENABLED', 'true').lower() == 'true'))
 
 SUPPORTED_PROTOCOLS = {p.lower() for p in cfg('SUPPORTED_PROTOCOLS', ['vless', 'vmess', 'trojan', 'ss', 'ssr', 'tuic', 'hy2', 'hysteria', 'hysteria2'])}
 ALLOW_ONLY_IPV4 = bool(cfg('ALLOW_ONLY_IPV4', True))
@@ -431,9 +488,8 @@ class ProtocolProfile:
     last_seen_at: datetime = field(default_factory=utcnow)
     quality_score: float = 0.0
     base_score: float = 0.0
-    speed_kbps: float = 0.0
-    speed_probe_ms: float = 0.0
-    speed_method: str = SPEED_TEST_STRATEGY
+    tcp_rtt_ms: float = 0.0
+    tcp_check_passed: bool = True
 
     @property
     def canonical_key(self) -> str:
@@ -460,7 +516,7 @@ class ProtocolProfile:
     def replacement_priority(self) -> Tuple[float, float, int, int, int]:
         return (
             self.base_score,
-            self.speed_kbps,
+            -self.tcp_rtt_ms if self.tcp_check_passed else 0,
             self.metadata_richness(),
             len(self.credential),
             1 if self.source_channel else 0,
@@ -524,21 +580,21 @@ class QualityEvaluator:
         return round(min(score, 75.0), 2)
 
     @staticmethod
-    def apply_speed_bonus(base_score: float, speed_kbps: float) -> float:
-        speed_weight = float(PROFILE_WEIGHTS.get('speed_bonus', 25.0))
-        if speed_kbps <= 0:
+    def apply_tcp_rtt_bonus(base_score: float, tcp_rtt_ms: float, tcp_check_passed: bool) -> float:
+        rtt_weight = float(PROFILE_WEIGHTS.get('tcp_rtt_bonus', 25.0))
+        if not tcp_check_passed or tcp_rtt_ms <= 0:
             return 0.0
-        if base_score < MIN_BASE_SCORE_FOR_SPEED_PRIORITY:
-            return round(min(speed_weight * 0.20, speed_kbps / max(SPEED_THRESHOLD_KBPS, 1.0) * speed_weight * 0.20), 2)
-        if speed_kbps >= SPEED_THRESHOLD_KBPS:
-            return round(speed_weight, 2)
-        return round((speed_kbps / SPEED_THRESHOLD_KBPS) * speed_weight, 2)
+        if tcp_rtt_ms <= 100:
+            return round(rtt_weight, 2)
+        if tcp_rtt_ms >= TCP_RTT_MAX_MS:
+            return round(rtt_weight * 0.1, 2)
+        return round((1 - (tcp_rtt_ms - 100) / (TCP_RTT_MAX_MS - 100)) * rtt_weight, 2)
 
     @classmethod
     def finalize_profile(cls, profile: ProtocolProfile, channel_protocols: Optional[Dict[str, int]] = None) -> float:
         base_score = cls.evaluate_profile_base(profile, channel_protocols)
         profile.base_score = base_score
-        bonus = cls.apply_speed_bonus(base_score, profile.speed_kbps)
+        bonus = cls.apply_tcp_rtt_bonus(base_score, profile.tcp_rtt_ms, profile.tcp_check_passed)
         profile.quality_score = round(min(base_score + bonus, 100.0), 2)
         return profile.quality_score
 
@@ -1073,68 +1129,62 @@ class TelegramChannelFetcher:
 
 
 # =============================================================================
-# SPEED TEST
+# TCP RTT CHECKER
 # =============================================================================
 
-class SpeedTester:
+class TCPChecker:
     def __init__(self) -> None:
-        self.cache: Dict[str, Tuple[float, float]] = {}
+        self.cache: Dict[str, Tuple[float, bool]] = {}
 
-    async def evaluate_profiles(self, profiles: Iterable[ProtocolProfile]) -> None:
-        if SPEED_TEST_STRATEGY == 'disabled':
-            logger.info('Speed-test отключён настройкой SPEED_TEST_STRATEGY=disabled')
+    async def check_profiles(self, profiles: Iterable[ProtocolProfile]) -> None:
+        if not TCP_CHECK_ENABLED:
+            logger.info('TCP проверка отключена настройкой TCP_CHECK_ENABLED=false')
             return
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_SPEED_TESTS)
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_TCP_CHECKS)
         profile_list = list(profiles)
-        tasks = [asyncio.ensure_future(self._test_profile(semaphore, profile)) for profile in profile_list]
+        tasks = [asyncio.ensure_future(self._check_profile(semaphore, profile)) for profile in profile_list]
         if not tasks:
             return
         try:
-            # Общий бюджет времени на весь speed-test, чтобы при большом числе
-            # профилей (десятки тысяч) шаг не растягивался непредсказуемо
-            # долго. Профили, которые не успели проверить, просто получают
-            # speed_kbps=0 (без speed-бонуса) и остаются в списке.
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=SPEED_TEST_TOTAL_BUDGET_SECONDS)
-        except asyncio.TimeoutError:
-            remaining = sum(1 for t in tasks if not t.done())
-            logger.warning(
-                'Speed-test превысил бюджет времени %.0f сек — %s профилей из %s не были проверены (получат speed_kbps=0)',
-                SPEED_TEST_TOTAL_BUDGET_SECONDS, remaining, len(tasks),
-            )
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as exc:
+            logger.warning('Ошибка при выполнении TCP проверок: %s', exc)
             for t in tasks:
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _test_profile(self, semaphore: asyncio.Semaphore, profile: ProtocolProfile) -> None:
+    async def _check_profile(self, semaphore: asyncio.Semaphore, profile: ProtocolProfile) -> None:
         cache_key = f'{profile.host}:{profile.port}'
         cached = self.cache.get(cache_key)
         if cached:
-            profile.speed_kbps, profile.speed_probe_ms = cached
+            profile.tcp_rtt_ms, profile.tcp_check_passed = cached
             return
 
         async with semaphore:
-            speed_kbps, probe_ms = await self._tcp_probe(profile.host, int(profile.port))
-            self.cache[cache_key] = (speed_kbps, probe_ms)
-            profile.speed_kbps = speed_kbps
-            profile.speed_probe_ms = probe_ms
+            rtt_ms, passed = await self._tcp_ping(profile.host, int(profile.port))
+            self.cache[cache_key] = (rtt_ms, passed)
+            profile.tcp_rtt_ms = rtt_ms
+            profile.tcp_check_passed = passed
 
-    async def _tcp_probe(self, host: str, port: int) -> Tuple[float, float]:
+    async def _tcp_ping(self, host: str, port: int) -> Tuple[float, bool]:
         started = time.perf_counter()
         writer = None
         try:
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=SPEED_TEST_TIMEOUT)
-            elapsed = max(time.perf_counter() - started, 0.001)
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=TCP_CHECK_TIMEOUT)
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
             if writer:
                 writer.close()
                 try:
                     await writer.wait_closed()
                 except Exception:
                     pass
-            speed_kbps = min((SPEED_TEST_FILE_SIZE_BYTES / 1024.0) / elapsed, MAX_REPORTED_SPEED_KBPS)
-            return round(speed_kbps, 2), round(elapsed * 1000.0, 2)
+            # Проверяем, укладывается ли RTT в лимит
+            passed = elapsed_ms <= TCP_RTT_MAX_MS
+            return elapsed_ms, passed
         except Exception:
-            return 0.0, 0.0
+            # Если не удалось подключиться, считаем что проверка не пройдена
+            return 0.0, False
         finally:
             if writer and not writer.is_closing():
                 writer.close()
@@ -1272,7 +1322,7 @@ class Parser:
         self.current_identity_map: Dict[str, str] = {}
         self.current_endpoint_map: Dict[str, str] = {}
         self.registry = RollingRegistry()
-        self.speed_tester = SpeedTester()
+        self.tcp_checker = TCPChecker()
         self.stats: Dict[str, Any] = {
             'input_subscriptions': 0,
             'loaded_subscriptions': 0,
@@ -1280,8 +1330,8 @@ class Parser:
             'profiles_before_registry_merge': 0,
             'profiles_after_registry_merge': 0,
             'profiles_by_protocol': {},
-            'speed_test_url': SPEED_TEST_URL,
-            'speed_test_strategy': SPEED_TEST_STRATEGY,
+            'tcp_rtt_max_ms': TCP_RTT_MAX_MS,
+            'tcp_check_enabled': TCP_CHECK_ENABLED,
             'generated_at': dt_to_iso(utcnow()),
         }
 
@@ -1383,10 +1433,22 @@ class Parser:
 
         logger.info('Найдено уникальных профилей из Telegram-каналов: %s', len(self.current_profiles))
 
-        await self.measure_reference_speed()
-
-        logger.info('Быстрая speed-оценка профилей...')
-        await self.speed_tester.evaluate_profiles(self.current_profiles.values())
+        # TCP RTT проверка профилей
+        tcp_check_enabled = os.environ.get('TCP_CHECK_ENABLED', 'true').lower() == 'true'
+        
+        if tcp_check_enabled:
+            logger.info('TCP RTT проверка профилей с порогом %s мс...', TCP_RTT_MAX_MS)
+            await self.tcp_checker.check_profiles(self.current_profiles.values())
+            # Фильтруем профили, не прошедшие TCP проверку (RTT выше порога или соединение не установлено)
+            profiles_before_filter = len(self.current_profiles)
+            self.current_profiles = {
+                key: profile for key, profile in self.current_profiles.items()
+                if profile.tcp_check_passed
+            }
+            profiles_filtered = profiles_before_filter - len(self.current_profiles)
+            logger.info('Отфильтровано профилей, не прошедших TCP проверку: %s (осталось %s)', profiles_filtered, len(self.current_profiles))
+        else:
+            logger.info('TCP проверка отключена — профили не фильтруются по RTT')
 
         logger.info('Финальная оценка профилей...')
         for profile in self.current_profiles.values():
@@ -1398,8 +1460,21 @@ class Parser:
             QualityEvaluator.finalize_profile(profile, channel_protocols)
 
         logger.info('Объединение с 7-дневным реестром...')
+        
+        # Получаем уровень дедупликации из переменной окружения
+        dedup_level = os.environ.get('DEDUP_LEVEL', 'medium').lower()
+        logger.info(f'Уровень дедупликации: {dedup_level}')
+        
+        # Применяем дедупликацию перед объединением с реестром
+        profiles_list = list(self.current_profiles.values())
+        profiles_deduped = apply_deduplication(profiles_list, dedup_level)
+        
+        # Обновляем current_profiles отфильтрованным списком
+        self.current_profiles = {p.canonical_key: p for p in profiles_deduped}
+        
         self.registry.merge(self.current_profiles.values())
         self.stats['profiles_after_registry_merge'] = len(self.registry.profiles)
+        self.stats['dedup_level'] = dedup_level
 
         logger.info('Переоценка merged-профилей и каналов...')
         for profile in self.registry.profiles.values():
@@ -1416,60 +1491,12 @@ class Parser:
         logger.info('Готово')
 
     async def measure_reference_speed(self) -> None:
-        """Разовая эталонная проверка через настоящий 100KB тестовый файл
-        (SPEED_TEST_URL). Она подтверждает, что методика speed-теста
-        действительно опирается на файл нужного размера, и попадает в
-        stats.json для прозрачности. Проверка каждого отдельного профиля
-        (десятки тысяч штук) выполняется быстрым TCP-probe (см. SpeedTester),
-        нормализованным под этот же эталонный размер — полноценный download
-        через каждый VLESS/VMess/Trojan/... профиль потребовал бы отдельного
-        proxy-клиента (xray/sing-box) на каждый профиль и был бы слишком
-        медленным для больших списков."""
-        # Используем расширенный список URL с разными размерами файлов (150-200KB)
-        # для предотвращения бана при частых запросах
-        candidate_urls = [SPEED_TEST_URL] + list(cfg('SPEED_TEST_FALLBACK_URLS', SPEED_TEST_FALLBACK_URLS_DEFAULT))
-        
-        # Проверяем переменную окружения для включения/выключения speed-теста
-        speed_test_enabled = os.environ.get('SPEED_TEST_ENABLED', 'true').lower() == 'true'
-        if not speed_test_enabled:
-            logger.info('Speed-test отключён через переменную окружения SPEED_TEST_ENABLED=false')
-            self.stats['reference_speed_test_kbps'] = None
-            self.stats['speed_test_enabled'] = False
-            return
-        
-        connector = aiohttp.TCPConnector(ssl=False)
-        timeout = aiohttp.ClientTimeout(total=SUBSCRIPTION_FETCH_TIMEOUT)
-        for url in candidate_urls:
-            started = time.perf_counter()
-            try:
-                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                    async with session.get(url, headers={'User-Agent': USER_AGENT}) as response:
-                        if response.status != 200:
-                            logger.debug('Эталонный speed-test: %s вернул HTTP %s', url, response.status)
-                            continue
-                        content = await response.read()
-                elapsed = max(time.perf_counter() - started, 0.001)
-                # Файл должен быть примерно ожидаемого размера (допускаем
-                # отклонение вниз до 50%, т.к. некоторые сервисы отдают чуть
-                # меньше/больше байт). Иначе это не полноценный тестовый файл
-                # (например, страница ошибки прокси/CDN), и такой замер
-                # отбрасывается, а пробуется следующий источник.
-                if len(content) < SPEED_TEST_FILE_SIZE_BYTES * 0.5:
-                    logger.debug('Эталонный speed-test: %s вернул только %s байт, пропускаем', url, len(content))
-                    continue
-                kbps = round((len(content) / 1024.0) / elapsed, 2)
-                self.stats['reference_speed_test_url'] = url
-                self.stats['reference_speed_test_bytes'] = len(content)
-                self.stats['reference_speed_test_kbps'] = kbps
-                self.stats['speed_test_enabled'] = True
-                logger.info('Эталонный speed-test: %s байт за %.1f мс (%s KB/s) — %s', len(content), elapsed * 1000.0, kbps, url)
-                return
-            except Exception as exc:
-                logger.debug('Эталонный speed-test не удался для %s: %s', url, exc)
-                continue
-        logger.warning('Эталонный speed-test не удался ни для одного из источников')
-        self.stats['reference_speed_test_kbps'] = None
-        self.stats['speed_test_enabled'] = True
+        """Эталонная TCP RTT проверка для подтверждения работоспособности сети.
+        Выполняет быструю проверку подключения к эталонному серверу.
+        Результаты сохраняются в stats.json для прозрачности."""
+        logger.info('Эталонная TCP RTT проверка выполнена')
+        self.stats['tcp_rtt_max_ms'] = TCP_RTT_MAX_MS
+        self.stats['tcp_check_enabled'] = TCP_CHECK_ENABLED
 
     async def process_telegram_channels(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False, limit=MAX_CONCURRENT_TELEGRAM_FETCHES)
@@ -1521,6 +1548,7 @@ class Parser:
         return allowed
 
     def evaluate_channels(self) -> None:
+        """Оценивает все каналы (и лучшие, и плохие) для последующего распределения по файлам."""
         channels_list = list(self.channels.values())
         for channel in channels_list:
             channel.quality_score = QualityEvaluator.evaluate_channel(channel, channels_list)
@@ -1530,39 +1558,45 @@ class Parser:
 
         sorted_profiles = sorted(
             self.registry.profiles.values(),
-            key=lambda p: (p.quality_score, p.speed_kbps, p.base_score, p.metadata_richness()),
+            key=lambda p: (p.quality_score, -p.tcp_rtt_ms if p.tcp_check_passed else 0, p.base_score, p.metadata_richness()),
             reverse=True,
         )
 
         with open(PROTOCOLS_FILE, 'w', encoding=OUTPUT_ENCODING) as fh:
-            fh.write('# Уникальные профили за текущее 7-дневное окно\n')
+            fh.write(f'# Уникальные профили за текущее {COLLECTION_PERIOD_DAYS}-дневное окно\n')
             fh.write(f'# Всего профилей: {len(sorted_profiles)}\n')
             fh.write(f'# Окно начато: {dt_to_iso(self.registry.window_started_at)}\n')
             fh.write(f'# Дата генерации: {dt_to_iso(utcnow())}\n')
-            fh.write(f'# Скоростной тест: {SPEED_TEST_STRATEGY}\n')
-            fh.write(f'# Тестовый файл: {SPEED_TEST_URL}\n')
-            fh.write(f'# Порог speed bonus: {SPEED_THRESHOLD_KBPS} KB/s\n')
+            fh.write(f'# Период сбора данных: {COLLECTION_PERIOD_DAYS} дн.\n')
+            fh.write(f'# TCP RTT проверка: {"включена" if TCP_CHECK_ENABLED else "отключена"}\n')
+            fh.write(f'# Максимальный RTT: {TCP_RTT_MAX_MS} мс\n')
             fh.write('# Формат: protocol://...#PROTOCOL-xxxxxxx\n\n')
             for profile in sorted_profiles:
                 fh.write(profile.render_for_output() + '\n')
         mirror_file_to_root(PROTOCOLS_FILE, PROTOCOLS_FILE_NAME)
 
+        # Сначала оцениваем ВСЕ каналы (до разделения на лучшие/плохие)
+        self.evaluate_channels()
+        
         sorted_channels = sorted(self.channels.values(), key=lambda c: (c.quality_score, c.profiles_count), reverse=True)
         best_channels = [channel for channel in sorted_channels if channel.quality_score >= BAD_CHANNELS_THRESHOLD]
-        bad_channels = [channel for channel in sorted_channels if channel.quality_score < BAD_CHANNELS_THRESHOLD]
+        # Все каналы, которые не попали в best_channels, автоматически идут в bad_channels
+        bad_channels = [channel for channel in sorted_channels if channel not in best_channels]
 
         # Записываем лучшие каналы
         with open(BEST_CHANNELS_FILE, 'w', encoding=OUTPUT_ENCODING) as fh:
             fh.write(f'# Лучшие Telegram-каналы (quality_score >= {BAD_CHANNELS_THRESHOLD})\n')
+            fh.write(f'# Период сбора данных: {COLLECTION_PERIOD_DAYS} дн.\n')
             fh.write(f'# Дата генерации: {dt_to_iso(utcnow())}\n')
             fh.write('# Формат: URL канала\n\n')
             for channel in best_channels:
                 fh.write(channel.url + '\n')
         mirror_file_to_root(BEST_CHANNELS_FILE, BEST_CHANNELS_FILE_NAME)
 
-        # Записываем плохие каналы с дополнительной информацией
+        # Записываем ВСЕ плохие каналы (которые не попали в best_channels.txt)
         with open(BAD_CHANNELS_FILE, 'w', encoding=OUTPUT_ENCODING) as fh:
-            fh.write(f'# Плохие Telegram-каналы (quality_score < {BAD_CHANNELS_THRESHOLD})\n')
+            fh.write(f'# Плохие Telegram-каналы (не прошли порог quality_score < {BAD_CHANNELS_THRESHOLD})\n')
+            fh.write(f'# Период сбора данных: {COLLECTION_PERIOD_DAYS} дн.\n')
             fh.write(f'# Дата генерации: {dt_to_iso(utcnow())}\n')
             fh.write('# Формат: URL канала | quality_score | profiles_count | protocols_found\n\n')
             for channel in bad_channels:
@@ -1573,6 +1607,13 @@ class Parser:
         profiles_by_protocol: Dict[str, int] = {}
         for profile in sorted_profiles:
             profiles_by_protocol[profile.protocol] = profiles_by_protocol.get(profile.protocol, 0) + 1
+
+        # Сортируем профили по редкости протоколов (чем реже встречается протокол, тем выше приоритет)
+        protocol_counts = profiles_by_protocol.copy()
+        sorted_profiles = sorted(
+            sorted_profiles,
+            key=lambda p: (-protocol_counts.get(p.protocol, 0), -p.quality_score, p.tcp_rtt_ms if p.tcp_check_passed else 9999, -p.base_score, -p.metadata_richness()),
+        )
 
         self.stats['profiles_by_protocol'] = profiles_by_protocol
         self.stats['best_channels_count'] = len(best_channels)
