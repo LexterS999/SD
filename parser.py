@@ -256,8 +256,8 @@ TELEGRAM_MESSAGES_LIMIT = int(cfg('TELEGRAM_MESSAGES_LIMIT', 100))
 TELEGRAM_WEB_PREVIEW_ENABLED = bool(cfg('TELEGRAM_WEB_PREVIEW_ENABLED', True))
 TELEGRAM_WEB_PREVIEW_MAX_PAGES = int(cfg('TELEGRAM_WEB_PREVIEW_MAX_PAGES', 3))
 
-# Настройки TCP RTT проверки
-TCP_RTT_MAX_MS = float(cfg('TCP_RTT_MAX_MS', os.environ.get('TCP_RTT_MAX_MS', '500')))
+# Настройки TCP/HTTP проверки
+TCP_CHECK_TIMEOUT = float(cfg('TCP_CHECK_TIMEOUT', 5.0))
 TCP_CHECK_ENABLED = bool(cfg('TCP_CHECK_ENABLED', os.environ.get('TCP_CHECK_ENABLED', 'true').lower() == 'true'))
 
 SUPPORTED_PROTOCOLS = {p.lower() for p in cfg('SUPPORTED_PROTOCOLS', ['vless', 'vmess', 'trojan', 'ss', 'ssr', 'tuic', 'hy2', 'hysteria', 'hysteria2'])}
@@ -584,11 +584,14 @@ class QualityEvaluator:
         rtt_weight = float(PROFILE_WEIGHTS.get('tcp_rtt_bonus', 25.0))
         if not tcp_check_passed or tcp_rtt_ms <= 0:
             return 0.0
+        # Чем меньше RTT, тем выше бонус (максимум при RTT <= 100мс)
         if tcp_rtt_ms <= 100:
             return round(rtt_weight, 2)
-        if tcp_rtt_ms >= TCP_RTT_MAX_MS:
+        # Плавное уменьшение бонуса с ростом RTT
+        max_rtt_for_bonus = 1000.0  # Максимальный RTT для получения бонуса
+        if tcp_rtt_ms >= max_rtt_for_bonus:
             return round(rtt_weight * 0.1, 2)
-        return round((1 - (tcp_rtt_ms - 100) / (TCP_RTT_MAX_MS - 100)) * rtt_weight, 2)
+        return round((1 - (tcp_rtt_ms - 100) / (max_rtt_for_bonus - 100)) * rtt_weight, 2)
 
     @classmethod
     def finalize_profile(cls, profile: ProtocolProfile, channel_protocols: Optional[Dict[str, int]] = None) -> float:
@@ -1179,9 +1182,8 @@ class TCPChecker:
                     await writer.wait_closed()
                 except Exception:
                     pass
-            # Проверяем, укладывается ли RTT в лимит
-            passed = elapsed_ms <= TCP_RTT_MAX_MS
-            return elapsed_ms, passed
+            # TCP подключение успешно — профиль рабочий
+            return elapsed_ms, True
         except Exception:
             # Если не удалось подключиться, считаем что проверка не пройдена
             return 0.0, False
@@ -1330,7 +1332,6 @@ class Parser:
             'profiles_before_registry_merge': 0,
             'profiles_after_registry_merge': 0,
             'profiles_by_protocol': {},
-            'tcp_rtt_max_ms': TCP_RTT_MAX_MS,
             'tcp_check_enabled': TCP_CHECK_ENABLED,
             'generated_at': dt_to_iso(utcnow()),
         }
@@ -1433,13 +1434,13 @@ class Parser:
 
         logger.info('Найдено уникальных профилей из Telegram-каналов: %s', len(self.current_profiles))
 
-        # TCP RTT проверка профилей
+        # TCP проверка профилей (проверка подключения)
         tcp_check_enabled = os.environ.get('TCP_CHECK_ENABLED', 'true').lower() == 'true'
         
         if tcp_check_enabled:
-            logger.info('TCP RTT проверка профилей с порогом %s мс...', TCP_RTT_MAX_MS)
+            logger.info('TCP проверка профилей (подтверждение работоспособности)...')
             await self.tcp_checker.check_profiles(self.current_profiles.values())
-            # Фильтруем профили, не прошедшие TCP проверку (RTT выше порога или соединение не установлено)
+            # Фильтруем профили, не прошедшие TCP проверку (соединение не установлено)
             profiles_before_filter = len(self.current_profiles)
             self.current_profiles = {
                 key: profile for key, profile in self.current_profiles.items()
@@ -1448,7 +1449,7 @@ class Parser:
             profiles_filtered = profiles_before_filter - len(self.current_profiles)
             logger.info('Отфильтровано профилей, не прошедших TCP проверку: %s (осталось %s)', profiles_filtered, len(self.current_profiles))
         else:
-            logger.info('TCP проверка отключена — профили не фильтруются по RTT')
+            logger.info('TCP проверка отключена — профили не фильтруются')
 
         logger.info('Финальная оценка профилей...')
         for profile in self.current_profiles.values():
@@ -1491,11 +1492,10 @@ class Parser:
         logger.info('Готово')
 
     async def measure_reference_speed(self) -> None:
-        """Эталонная TCP RTT проверка для подтверждения работоспособности сети.
+        """Эталонная TCP проверка для подтверждения работоспособности сети.
         Выполняет быструю проверку подключения к эталонному серверу.
         Результаты сохраняются в stats.json для прозрачности."""
-        logger.info('Эталонная TCP RTT проверка выполнена')
-        self.stats['tcp_rtt_max_ms'] = TCP_RTT_MAX_MS
+        logger.info('Эталонная TCP проверка выполнена')
         self.stats['tcp_check_enabled'] = TCP_CHECK_ENABLED
 
     async def process_telegram_channels(self) -> None:
@@ -1568,8 +1568,7 @@ class Parser:
             fh.write(f'# Окно начато: {dt_to_iso(self.registry.window_started_at)}\n')
             fh.write(f'# Дата генерации: {dt_to_iso(utcnow())}\n')
             fh.write(f'# Период сбора данных: {COLLECTION_PERIOD_DAYS} дн.\n')
-            fh.write(f'# TCP RTT проверка: {"включена" if TCP_CHECK_ENABLED else "отключена"}\n')
-            fh.write(f'# Максимальный RTT: {TCP_RTT_MAX_MS} мс\n')
+            fh.write(f'# TCP проверка: {"включена" if TCP_CHECK_ENABLED else "отключена"}\n')
             fh.write('# Формат: protocol://...#PROTOCOL-xxxxxxx\n\n')
             for profile in sorted_profiles:
                 fh.write(profile.render_for_output() + '\n')

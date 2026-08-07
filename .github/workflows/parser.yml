@@ -1,4 +1,4 @@
-name: Парсинг
+name: Парсер
 
 on:
   schedule:
@@ -21,21 +21,16 @@ on:
           - medium
           - aggressive
       tcp_check_enabled:
-        description: 'Включить TCP RTT проверку'
+        description: 'Включить TCP проверку профилей на работоспособность'
         required: false
         default: true
         type: boolean
-      tcp_rtt_max_ms:
-        description: 'Максимальный RTT в мс (профили с большим RTT будут отфильтрованы)'
-        required: false
-        default: '500'
-        type: string
 
 permissions:
   contents: write
 
 jobs:
-  parse_and_notify:
+  parse:
     runs-on: ubuntu-latest
     steps:
       - name: 📦 Checkout code
@@ -55,13 +50,11 @@ jobs:
         run: |
           echo "DEDUP_LEVEL=${{ github.event.inputs.dedup_level || 'medium' }}" >> $GITHUB_ENV
           echo "TCP_CHECK_ENABLED=${{ github.event.inputs.tcp_check_enabled || 'true' }}" >> $GITHUB_ENV
-          echo "TCP_RTT_MAX_MS=${{ github.event.inputs.tcp_rtt_max_ms || '500' }}" >> $GITHUB_ENV
           echo "COLLECTION_PERIOD_DAYS=${{ github.event.inputs.collection_period_days || '7' }}" >> $GITHUB_ENV
 
-      - name: 🚀 Парсинг и Уведомление
+      - name: 🚀 Запуск парсера
         run: |
           python parser.py
-          echo "Уведомление о завершении: Парсинг успешно завершен."
 
       - name: 📤 Commit and push output files
         run: |
