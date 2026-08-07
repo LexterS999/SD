@@ -73,6 +73,11 @@ CHANNEL_WINDOW_DAYS = int(cfg('CHANNEL_WINDOW_DAYS', COLLECTION_PERIOD_DAYS))
 REGISTRY_RESET_DAYS = int(cfg('REGISTRY_RESET_DAYS', 7))
 MERGE_WITH_PREVIOUS_REGISTRY = bool(cfg('MERGE_WITH_PREVIOUS_REGISTRY', True))
 
+# Progressive window extension - автоматическое увеличение периода при нехватке профилей
+PROGRESSIVE_WINDOW_EXTENSION_ENABLED = bool(cfg('PROGRESSIVE_WINDOW_EXTENSION_ENABLED', True))
+MIN_PROFILES_THRESHOLD = int(cfg('MIN_PROFILES_THRESHOLD', 50))
+MAX_COLLECTION_PERIOD_DAYS = int(cfg('MAX_COLLECTION_PERIOD_DAYS', 30))
+
 PROTOCOLS_FILE_NAME = cfg('PROTOCOLS_FILE', 'protocols.txt')
 BEST_CHANNELS_FILE_NAME = cfg('BEST_CHANNELS_FILE', 'best_channels.txt')
 BAD_CHANNELS_FILE_NAME = cfg('BAD_CHANNELS_FILE', 'bad_channels.txt')
@@ -136,6 +141,28 @@ MAX_PROFILES_PER_SUBNET_24 = int(cfg('MAX_PROFILES_PER_SUBNET_24', 10))
 # Настройки для проверки UUID
 UUID_CHECK_ENABLED = bool(cfg('UUID_CHECK_ENABLED', True))
 
+# Rate limiting per channel
+RATE_LIMIT_PER_CHANNEL = int(cfg('RATE_LIMIT_PER_CHANNEL', 100))
+
+# Cooldown period для плохих каналов (в часах)
+CHANNEL_COOLDOWN_HOURS = int(cfg('CHANNEL_COOLDOWN_HOURS', 24))
+BAD_CHANNEL_STREAK_THRESHOLD = int(cfg('BAD_CHANNEL_STREAK_THRESHOLD', 3))
+
+# Freshness decay настройки
+FRESHNESS_DECAY_ENABLED = bool(cfg('FRESHNESS_DECAY_ENABLED', True))
+FRESHNESS_DECAY_HALF_LIFE_HOURS = float(cfg('FRESHNESS_DECAY_HALF_LIFE_HOURS', 12.0))
+FRESHNESS_DECAY_MIN_SCORE = float(cfg('FRESHNESS_DECAY_MIN_SCORE', 0.1))
+
+# Historical weight accumulation
+HISTORICAL_WEIGHT_ACCUMULATION_ENABLED = bool(cfg('HISTORICAL_WEIGHT_ACCUMULATION_ENABLED', True))
+HISTORICAL_WEIGHT_PER_DAY = float(cfg('HISTORICAL_WEIGHT_PER_DAY', 2.0))
+HISTORICAL_WEIGHT_MAX = float(cfg('HISTORICAL_WEIGHT_MAX', 30.0))
+
+# Graceful degradation
+GRACEFUL_DEGRADATION_ENABLED = bool(cfg('GRACEFUL_DEGRADATION_ENABLED', True))
+GRACEFUL_DEGRADATION_STEP = float(cfg('GRACEFUL_DEGRADATION_STEP', 5.0))
+GRACEFUL_DEGRADATION_MIN_SCORE = float(cfg('GRACEFUL_DEGRADATION_MIN_SCORE', 10.0))
+
 SUPPORTED_PROTOCOLS = {p.lower() for p in cfg('SUPPORTED_PROTOCOLS', ['vless', 'vmess', 'trojan', 'ss', 'ssr', 'tuic', 'hy2', 'hysteria', 'hysteria2'])}
 ALLOW_ONLY_IPV4 = bool(cfg('ALLOW_ONLY_IPV4', True))
 REJECT_NON_PUBLIC_IPV4 = bool(cfg('REJECT_NON_PUBLIC_IPV4', True))
@@ -171,6 +198,9 @@ MODERN_ALPN_BONUS = float(cfg('MODERN_ALPN_BONUS', 5.0))
 MIN_CREDENTIAL_LENGTH = int(cfg('MIN_CREDENTIAL_LENGTH', 8))
 CREDENTIAL_LENGTH_BONUS = float(cfg('CREDENTIAL_LENGTH_BONUS', 3.0))
 
+# Временная валидность профилей
+PROFILE_EXPIRY_ENABLED = bool(cfg('PROFILE_EXPIRY_ENABLED', True))
+
 PROTOCOLS_FILE = os.path.join(OUTPUT_DIR, PROTOCOLS_FILE_NAME)
 BEST_CHANNELS_FILE = os.path.join(OUTPUT_DIR, BEST_CHANNELS_FILE_NAME)
 BAD_CHANNELS_FILE = os.path.join(OUTPUT_DIR, BAD_CHANNELS_FILE_NAME)
@@ -183,6 +213,32 @@ CHANGES_REPORT_FILE = os.path.join(OUTPUT_DIR, CHANGES_REPORT_FILE_NAME)
 REGISTRY_VERSION = 3
 DECORATIVE_KEYS = {'title', 'name', 'ps', 'remark', 'remarks', 'description', 'tag'}
 HYSTERIA_SCHEMES = {'hy2', 'hysteria', 'hysteria2'}
+
+# =============================================================================
+# BLOOM FILTER ДЛЯ ДЕДУПЛИКАЦИИ
+# =============================================================================
+
+class SimpleBloomFilter:
+    """Простая реализация Bloom filter для быстрой проверки дубликатов."""
+    
+    def __init__(self, size: int = 10000, hash_count: int = 3):
+        self.size = size
+        self.hash_count = hash_count
+        self.bit_array = [False] * size
+    
+    def _hashes(self, item: str) -> List[int]:
+        hashes = []
+        for i in range(self.hash_count):
+            h = hashlib.md5(f"{item}:{i}".encode()).hexdigest()
+            hashes.append(int(h, 16) % self.size)
+        return hashes
+    
+    def add(self, item: str) -> None:
+        for h in self._hashes(item):
+            self.bit_array[h] = True
+    
+    def __contains__(self, item: str) -> bool:
+        return all(self.bit_array[h] for h in self._hashes(item))
 
 
 # =============================================================================
@@ -450,6 +506,9 @@ class TelegramChannel:
     quality_score: float = 0.0
     protocols_found: Dict[str, int] = field(default_factory=dict)
     last_updated: Optional[datetime] = None
+    # Cooldown period для плохих каналов
+    bad_streak: int = 0
+    cooldown_until: Optional[datetime] = None
 
 
 # =============================================================================
@@ -457,6 +516,119 @@ class TelegramChannel:
 # =============================================================================
 
 class QualityEvaluator:
+    @staticmethod
+    def validate_reality_consistency(profile: ProtocolProfile) -> bool:
+        """Консистентность параметров Reality — расширенная валидация."""
+        if profile.protocol != 'vless':
+            return True
+        
+        query = profile.metadata.get('query', {})
+        security = query.get('security', '')
+        
+        if security != 'reality':
+            return True
+        
+        # Проверка наличия обязательных ключей
+        required_keys = {'pbk', 'sid', 'sni'}
+        if not required_keys.issubset(set(k.lower() for k in query.keys())):
+            return False
+        
+        # Валидация pbk - должен быть валидным публичным ключом X25519 (32 байта в base64)
+        pbk = query.get('pbk', '')
+        if pbk:
+            try:
+                decoded_pbk = base64.b64decode(pbk + '=' * (-len(pbk) % 4))
+                if len(decoded_pbk) != 32:
+                    return False
+            except Exception:
+                return False
+        
+        # Валидация sid - должен быть hex строкой правильной длины (обычно 16 байт = 32 hex символа)
+        sid = query.get('sid', '')
+        if sid:
+            if len(sid) < 8 or len(sid) > 64:
+                return False
+            try:
+                int(sid, 16)
+            except ValueError:
+                return False
+        
+        return True
+    
+    @staticmethod
+    def parse_profile_expiry(profile: ProtocolProfile) -> Optional[datetime]:
+        """Временная валидность профилей - парсинг дат истечения из метаданных."""
+        if not PROFILE_EXPIRY_ENABLED:
+            return None
+        
+        query = profile.metadata.get('query', {})
+        
+        # Поиск параметра expiry/until/expire
+        for key in ['expiry', 'until', 'expire', 'exp']:
+            if key in query:
+                try:
+                    # Пробуем разные форматы
+                    val = query[key]
+                    # Timestamp (секунды)
+                    if val.isdigit() and len(val) >= 10:
+                        return datetime.fromtimestamp(int(val))
+                    # ISO формат
+                    if 'T' in val:
+                        return datetime.fromisoformat(val.replace('Z', '+00:00')).replace(tzinfo=None)
+                except Exception:
+                    pass
+        
+        return None
+    
+    @staticmethod
+    def is_profile_expired(profile: ProtocolProfile) -> bool:
+        """Проверка истечения срока действия профиля."""
+        expiry_date = QualityEvaluator.parse_profile_expiry(profile)
+        if expiry_date is None:
+            return False
+        return utcnow() > expiry_date
+    
+    @staticmethod
+    def apply_freshness_decay(profile: ProtocolProfile, base_score: float) -> float:
+        """Эвристика freshness decay - экспоненциальное снижение scores со временем."""
+        if not FRESHNESS_DECAY_ENABLED:
+            return base_score
+        
+        hours_since_seen = (utcnow() - profile.last_seen_at).total_seconds() / 3600.0
+        half_life = FRESHNESS_DECAY_HALF_LIFE_HOURS
+        
+        # Экспоненциальный decay: score = base * (0.5 ^ (hours / half_life))
+        decay_factor = math.pow(0.5, hours_since_seen / half_life)
+        decay_factor = max(decay_factor, FRESHNESS_DECAY_MIN_SCORE)
+        
+        return round(base_score * decay_factor, 2)
+    
+    @staticmethod
+    def apply_historical_weight_accumulation(profile: ProtocolProfile) -> float:
+        """Historical weight accumulation - накопление бонусов за каждый день успешной работы."""
+        if not HISTORICAL_WEIGHT_ACCUMULATION_ENABLED:
+            return 0.0
+        
+        days_active = (utcnow() - profile.first_seen_at).days
+        if days_active <= 0:
+            return 0.0
+        
+        accumulated_weight = min(days_active * HISTORICAL_WEIGHT_PER_DAY, HISTORICAL_WEIGHT_MAX)
+        return round(accumulated_weight, 2)
+    
+    @staticmethod
+    def apply_graceful_degradation(profile: ProtocolProfile, current_score: float) -> float:
+        """Graceful degradation - постепенное снижение приоритета вместо мгновенного удаления."""
+        if not GRACEFUL_DEGRADATION_ENABLED:
+            return current_score
+        
+        # Если профиль не прошёл TCP проверку, постепенно снижаем score
+        if not profile.tcp_check_passed:
+            degraded_score = current_score - GRACEFUL_DEGRADATION_STEP
+            return max(degraded_score, GRACEFUL_DEGRADATION_MIN_SCORE)
+        
+        return current_score
+    
     @staticmethod
     def evaluate_profile_base(profile: ProtocolProfile, channel_protocols: Optional[Dict[str, int]] = None) -> float:
         score = float(PROFILE_WEIGHTS.get('base', 20.0))
@@ -608,17 +780,38 @@ class QualityEvaluator:
 
     @classmethod
     def finalize_profile(cls, profile: ProtocolProfile, channel_protocols: Optional[Dict[str, int]] = None) -> float:
+        # Lazy evaluation scores - вычисление quality_score только для профилей прошедших базовые фильтры
+        
+        # Проверка на истечение срока действия профиля
+        if cls.is_profile_expired(profile):
+            profile.quality_score = 0.0
+            return 0.0
+        
+        # Консистентность параметров Reality
+        if not cls.validate_reality_consistency(profile):
+            profile.quality_score = 0.0
+            return 0.0
+        
         base_score = cls.evaluate_profile_base(profile, channel_protocols)
         profile.base_score = base_score
+        
+        # Применяем freshness decay
+        base_score = cls.apply_freshness_decay(profile, base_score)
         
         # Применяем TCP RTT бонус с учетом jitter
         bonus = cls.apply_tcp_rtt_bonus(base_score, profile.tcp_rtt_ms, profile.tcp_check_passed, profile.tcp_rtt_jitter)
         
-        # Применяем historical score
-        historical_score = cls.apply_historical_score(profile)
-        profile.historical_score = historical_score
+        # Применяем historical score (старый метод)
+        historical_score_old = cls.apply_historical_score(profile)
         
-        profile.quality_score = round(min(base_score + bonus + historical_score, 100.0), 2)
+        # Применяем historical weight accumulation (новый метод)
+        historical_weight = cls.apply_historical_weight_accumulation(profile)
+        profile.historical_score = historical_score_old + historical_weight
+        
+        # Применяем graceful degradation
+        final_score = cls.apply_graceful_degradation(profile, base_score + bonus + profile.historical_score)
+        
+        profile.quality_score = round(min(final_score, 100.0), 2)
         return profile.quality_score
 
     @staticmethod
@@ -980,6 +1173,40 @@ class SubscriptionFetcher:
         'Accept': '*/*',
         'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
     }
+    
+    # Connection pooling для HTTP запросов - переиспользование соединений
+    _connector: Optional[aiohttp.TCPConnector] = None
+    _session: Optional[aiohttp.ClientSession] = None
+    
+    @classmethod
+    def get_connector(cls) -> aiohttp.TCPConnector:
+        """Connection pooling - переиспользование TCP соединений."""
+        if cls._connector is None or cls._connector.closed:
+            cls._connector = aiohttp.TCPConnector(
+                ssl=False, 
+                limit=MAX_CONCURRENT_SUBSCRIPTION_FETCHES,
+                limit_per_host=10,  # Лимит соединений на хост
+                ttl_dns_cache=300,  # TTL DNS кэша
+                use_dns_cache=True,  # Включить DNS кэш
+            )
+        return cls._connector
+    
+    @classmethod
+    async def get_session(cls) -> aiohttp.ClientSession:
+        """Получение сессии с connection pooling."""
+        if cls._session is None or cls._session.closed:
+            connector = cls.get_connector()
+            timeout = aiohttp.ClientTimeout(total=SUBSCRIPTION_FETCH_TIMEOUT)
+            cls._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        return cls._session
+    
+    @classmethod
+    async def close(cls) -> None:
+        """Закрытие соединений."""
+        if cls._session and not cls._session.closed:
+            await cls._session.close()
+        if cls._connector and not cls._connector.closed:
+            await cls._connector.close()
 
     @classmethod
     async def fetch_one(cls, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, url: str) -> Optional[str]:
@@ -1447,6 +1674,14 @@ class Parser:
         self.current_endpoint_map: Dict[str, str] = {}
         self.registry = RollingRegistry()
         self.tcp_checker = TCPChecker()
+        # Bloom filter для дедупликации
+        self.bloom_filter = SimpleBloomFilter(size=50000, hash_count=5)
+        # Rate limiting per channel
+        self.channel_profile_counts: Dict[str, int] = defaultdict(int)
+        # Channel cooldown tracking
+        self.channel_cooldowns: Dict[str, datetime] = {}
+        # Incremental parsing - отслеживание последних message_id
+        self.last_processed_message_ids: Dict[str, int] = {}
         self.stats: Dict[str, Any] = {
             'input_subscriptions': 0,
             'loaded_subscriptions': 0,
@@ -1456,6 +1691,9 @@ class Parser:
             'profiles_by_protocol': {},
             'tcp_check_enabled': TCP_CHECK_ENABLED,
             'generated_at': dt_to_iso(utcnow()),
+            'duplicates_filtered_by_bloom': 0,
+            'profiles_rate_limited': 0,
+            'channels_on_cooldown': 0,
         }
 
     def load_subscriptions(self) -> List[str]:
@@ -1469,6 +1707,29 @@ class Parser:
         return urls
 
     def register_profile(self, profile: ProtocolProfile) -> None:
+        """Регистрация профиля с rate limiting и bloom filter."""
+        # Bloom filter для дедупликации - быстрая проверка
+        if profile.canonical_key in self.bloom_filter:
+            self.stats['duplicates_filtered_by_bloom'] += 1
+            return
+        
+        # Rate limiting per channel
+        if profile.source_channel:
+            channel_lower = profile.source_channel.lower()
+            
+            # Проверка cooldown для канала
+            if channel_lower in self.channel_cooldowns:
+                if utcnow() < self.channel_cooldowns[channel_lower]:
+                    self.stats['channels_on_cooldown'] += 1
+                    return
+            
+            # Проверка лимита профилей на канал
+            if self.channel_profile_counts[channel_lower] >= RATE_LIMIT_PER_CHANNEL:
+                self.stats['profiles_rate_limited'] += 1
+                return
+            
+            self.channel_profile_counts[channel_lower] += 1
+        
         profile.last_seen_at = utcnow()
         if not profile.first_seen_at:
             profile.first_seen_at = profile.last_seen_at
@@ -1512,6 +1773,9 @@ class Parser:
         self.current_profiles[canonical_key] = profile
         self.current_identity_map[profile.identity_key] = canonical_key
         self.current_endpoint_map[profile.endpoint_key] = canonical_key
+        
+        # Добавляем в bloom filter после успешной регистрации
+        self.bloom_filter.add(profile.canonical_key)
 
     async def process(self) -> None:
         logger.info('Старт парсинга')
