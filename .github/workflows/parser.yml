@@ -5,24 +5,30 @@ on:
     - cron: '0 */3 * * *' # Запуск каждые 3 часа
   workflow_dispatch:
     inputs:
+      collection_period_days:
+        description: 'Период сбора данных в днях (телеграм-каналы и профили собираются за последние N дней)'
+        required: false
+        default: '7'
+        type: string
       dedup_level:
-        description: 'Уровень дедупликации (light, medium, aggressive)'
+        description: 'Уровень дедупликации (off, light, medium, aggressive)'
         required: false
         default: 'medium'
         type: choice
         options:
+          - off
           - light
           - medium
           - aggressive
-      speed_test_enabled:
-        description: 'Включить проверку скорости'
+      tcp_check_enabled:
+        description: 'Включить TCP RTT проверку'
         required: false
         default: true
         type: boolean
-      speed_threshold_kbps:
-        description: 'Минимальный порог скорости (KB/s)'
+      tcp_rtt_max_ms:
+        description: 'Максимальный RTT в мс (профили с большим RTT будут отфильтрованы)'
         required: false
-        default: '300'
+        default: '500'
         type: string
 
 permissions:
@@ -48,8 +54,9 @@ jobs:
       - name: ⚙️ Setup environment variables
         run: |
           echo "DEDUP_LEVEL=${{ github.event.inputs.dedup_level || 'medium' }}" >> $GITHUB_ENV
-          echo "SPEED_TEST_ENABLED=${{ github.event.inputs.speed_test_enabled || 'true' }}" >> $GITHUB_ENV
-          echo "SPEED_THRESHOLD_KBPS=${{ github.event.inputs.speed_threshold_kbps || '300' }}" >> $GITHUB_ENV
+          echo "TCP_CHECK_ENABLED=${{ github.event.inputs.tcp_check_enabled || 'true' }}" >> $GITHUB_ENV
+          echo "TCP_RTT_MAX_MS=${{ github.event.inputs.tcp_rtt_max_ms || '500' }}" >> $GITHUB_ENV
+          echo "COLLECTION_PERIOD_DAYS=${{ github.event.inputs.collection_period_days || '7' }}" >> $GITHUB_ENV
 
       - name: 🚀 Парсинг и Уведомление
         run: |
