@@ -49,174 +49,6 @@ except ImportError:  # pragma: no cover
 
 
 # =============================================================================
-# ВСТРОЕННЫЙ МОДУЛЬ ДЕДУПЛИКАЦИИ (dedup.py)
-# =============================================================================
-
-def _dedup_normalize_profile(uri):
-    """Нормализует профиль для дедупликации (без вреда для качества)."""
-    if not uri or not isinstance(uri, str):
-        return None
-
-    uri = uri.strip()
-    if not re.match(r'^(vless|vmess|trojan|ssr|ss|hysteria2?|tuic)://', uri, re.IGNORECASE):
-        return None
-
-    try:
-        base_uri = uri.split('#')[0]
-
-        if base_uri.lower().startswith('vmess://'):
-            try:
-                decoded = base64.b64decode(base_uri[8:] + '==').decode('utf-8')
-                config_vmess = json.loads(decoded)
-                key = f"vmess|{config_vmess.get('add','').lower()}|{config_vmess.get('port')}|{config_vmess.get('id','').lower()}|{config_vmess.get('net')}|{config_vmess.get('tls')}"
-                return key
-            except Exception:
-                return None
-
-        if base_uri.lower().startswith('ss://'):
-            try:
-                if '@' in base_uri:
-                    user_info, host_info = base_uri[5:].split('@', 1)
-                    if not host_info.startswith('http'):
-                        host_info = '//' + host_info
-                    parsed = urlparse(host_info)
-                    host = parsed.hostname
-                    port = parsed.port
-                    if ':' not in user_info:
-                        user_info = base64.b64decode(user_info + '==').decode('utf-8')
-                    method, _, password = user_info.partition(':')
-                    return f"ss|{host.lower()}|{port}|{method}|{password}"
-            except Exception:
-                return None
-
-        parsed = urlparse(base_uri)
-        host = parsed.hostname
-        if not host:
-            return None
-
-        port = parsed.port or (443 if parsed.scheme.lower() in ['vless', 'trojan'] else 80)
-        password = unquote(parsed.username or '')
-
-        query = parse_qs(parsed.query)
-        important_params = ['type', 'host', 'path', 'security', 'sni', 'fp', 'pbk', 'sid', 'sps']
-        query_str = "&".join(f"{k}={query[k][0]}" for k in important_params if k in query)
-
-        return f"{parsed.scheme.lower()}|{host.lower()}|{port}|{password}|{query_str}"
-
-    except Exception:
-        return None
-
-
-def _dedup_get_host_port(uri):
-    """Извлекает хост и порт для жесткой дедупликации по IP/Домену."""
-    norm = _dedup_normalize_profile(uri)
-    if norm:
-        parts = norm.split('|')
-        if len(parts) >= 3:
-            return f"{parts[1]}:{parts[2]}"
-    return None
-
-
-def light_deduplicate(profiles):
-    """Легкая дедупликация - только по каноническому ключу."""
-    initial_count = len(profiles)
-    logger.info(f"Запуск легкой дедупликации. Исходное количество: {initial_count}")
-
-    unique_profiles = {}
-    for p in profiles:
-        key = _dedup_normalize_profile(p)
-        if not key:
-            continue
-        if key not in unique_profiles:
-            unique_profiles[key] = p
-
-    final_profiles = list(unique_profiles.values())
-    final_count = len(final_profiles)
-    logger.info(f"Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
-
-    return final_profiles
-
-
-def medium_deduplicate(profiles):
-    """Средняя дедупликация - по каноническому ключу и identity_key."""
-    initial_count = len(profiles)
-    logger.info(f"Запуск средней дедупликации. Исходное количество: {initial_count}")
-
-    unique_profiles = {}
-    seen_identity = set()
-    for p in profiles:
-        key = _dedup_normalize_profile(p)
-        if not key:
-            continue
-        if key in unique_profiles:
-            continue
-        # Извлекаем identity из профиля для дополнительной проверки
-        try:
-            parsed = urlparse(p.split('#')[0])
-            identity = f"{parsed.scheme.lower()}|{parsed.hostname}|{parsed.port}"
-            if identity in seen_identity:
-                continue
-            seen_identity.add(identity)
-        except Exception:
-            pass
-        unique_profiles[key] = p
-
-    final_profiles = list(unique_profiles.values())
-    final_count = len(final_profiles)
-    logger.info(f"Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
-
-    return final_profiles
-
-
-def aggressive_deduplicate(profiles):
-    """Применяет все возможные фильтры для сокращения объема профилей."""
-    initial_count = len(profiles)
-    logger.info(f"Запуск глубокой дедупликации. Исходное количество: {initial_count}")
-
-    unique_profiles = {}
-    seen_host_port = set()
-
-    for p in profiles:
-        key = _dedup_normalize_profile(p)
-        if not key:
-            continue
-
-        if key in unique_profiles:
-            continue
-
-        hp = _dedup_get_host_port(p)
-        if hp and hp in seen_host_port:
-            continue
-
-        if hp:
-            seen_host_port.add(hp)
-
-        unique_profiles[key] = p
-
-    final_profiles = list(unique_profiles.values())
-    final_count = len(final_profiles)
-    logger.info(f"Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
-
-    return final_profiles
-
-
-def apply_deduplication(profiles, dedup_level):
-    """Применяет дедупликацию в зависимости от уровня."""
-    if dedup_level == 'off':
-        logger.info("Дедупликация отключена")
-        return profiles
-    elif dedup_level == 'light':
-        return light_deduplicate(profiles)
-    elif dedup_level == 'medium':
-        return medium_deduplicate(profiles)
-    elif dedup_level == 'aggressive':
-        return aggressive_deduplicate(profiles)
-    else:
-        logger.warning(f"Неизвестный уровень дедупликации '{dedup_level}', используется medium")
-        return medium_deduplicate(profiles)
-
-
-# =============================================================================
 # НАСТРОЙКИ
 # =============================================================================
 
@@ -267,7 +99,6 @@ STRICT_QUERY_IP_CHECK = bool(cfg('STRICT_QUERY_IP_CHECK', True))
 IP_LIKE_QUERY_KEYS = {str(x).lower() for x in cfg('IP_LIKE_QUERY_KEYS', ['ip', 'add', 'server', 'server_address', 'remote_addr'])}
 IGNORED_QUERY_KEYS = {str(x).lower() for x in cfg('IGNORED_QUERY_KEYS', [])}
 IGNORED_VMESS_KEYS = {str(x).lower() for x in cfg('IGNORED_VMESS_KEYS', [])}
-ENABLE_STRICT_DEDUPLICATION = bool(cfg('ENABLE_STRICT_DEDUPLICATION', True))
 
 BAD_CHANNELS_THRESHOLD = float(cfg('BAD_CHANNELS_THRESHOLD', 20.0))
 STANDARD_PORTS = {str(x) for x in cfg('STANDARD_PORTS', ['443', '80', '8443', '2053', '2083', '2087', '2096', '8080'])}
@@ -277,7 +108,6 @@ CHANNEL_WEIGHTS = dict(cfg('CHANNEL_WEIGHTS', {}))
 PROTOCOL_PATTERNS = dict(cfg('PROTOCOL_PATTERNS', {}))
 TG_PATTERNS = list(cfg('TG_PATTERNS', []))
 EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS = bool(cfg('EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS', False))
-DEDUPLICATE_BY_ENDPOINT = bool(cfg('DEDUPLICATE_BY_ENDPOINT', True))
 PROFILE_TAG_LENGTH = int(cfg('PROFILE_TAG_LENGTH', 7))
 PROFILE_TAG_ALPHABET = str(cfg('PROFILE_TAG_ALPHABET', 'abcdefghijklmnopqrstuvwxyz0123456789'))
 
@@ -1247,12 +1077,6 @@ class RollingRegistry:
             self._upsert(profile, allow_timestamp_update=True)
 
     def _upsert(self, profile: ProtocolProfile, allow_timestamp_update: bool) -> None:
-        if not ENABLE_STRICT_DEDUPLICATION:
-            self.profiles[profile.canonical_key] = profile
-            self.identity_map[profile.identity_key] = profile.canonical_key
-            self.endpoint_map[profile.endpoint_key] = profile.canonical_key
-            return
-
         canonical_key = profile.canonical_key
         existing = self.profiles.get(canonical_key)
         if existing:
@@ -1279,20 +1103,19 @@ class RollingRegistry:
                     incumbent.last_seen_at = max(incumbent.last_seen_at, profile.last_seen_at)
             return
 
-        if DEDUPLICATE_BY_ENDPOINT:
-            existing_by_endpoint_key = self.endpoint_map.get(profile.endpoint_key)
-            if existing_by_endpoint_key and existing_by_endpoint_key in self.profiles:
-                incumbent = self.profiles[existing_by_endpoint_key]
-                if profile.replacement_priority() > incumbent.replacement_priority():
-                    profile.first_seen_at = min(incumbent.first_seen_at, profile.first_seen_at)
-                    profile.last_seen_at = max(incumbent.last_seen_at, profile.last_seen_at)
-                    del self.profiles[existing_by_endpoint_key]
-                    self.profiles[canonical_key] = profile
-                    self.identity_map[profile.identity_key] = canonical_key
-                    self.endpoint_map[profile.endpoint_key] = canonical_key
-                else:
-                    if allow_timestamp_update:
-                        incumbent.last_seen_at = max(incumbent.last_seen_at, profile.last_seen_at)
+        existing_by_endpoint_key = self.endpoint_map.get(profile.endpoint_key)
+        if existing_by_endpoint_key and existing_by_endpoint_key in self.profiles:
+            incumbent = self.profiles[existing_by_endpoint_key]
+            if profile.replacement_priority() > incumbent.replacement_priority():
+                profile.first_seen_at = min(incumbent.first_seen_at, profile.first_seen_at)
+                profile.last_seen_at = max(incumbent.last_seen_at, profile.last_seen_at)
+                del self.profiles[existing_by_endpoint_key]
+                self.profiles[canonical_key] = profile
+                self.identity_map[profile.identity_key] = canonical_key
+                self.endpoint_map[profile.endpoint_key] = canonical_key
+            else:
+                if allow_timestamp_update:
+                    incumbent.last_seen_at = max(incumbent.last_seen_at, profile.last_seen_at)
                 return
 
         self.profiles[canonical_key] = profile
@@ -1375,18 +1198,17 @@ class Parser:
                 self.current_endpoint_map[profile.endpoint_key] = canonical_key
             return
 
-        if DEDUPLICATE_BY_ENDPOINT:
-            existing_by_endpoint = self.current_endpoint_map.get(profile.endpoint_key)
-            if existing_by_endpoint and existing_by_endpoint in self.current_profiles:
-                incumbent = self.current_profiles[existing_by_endpoint]
-                if profile.replacement_priority() > incumbent.replacement_priority():
-                    profile.first_seen_at = min(incumbent.first_seen_at, profile.first_seen_at)
-                    profile.last_seen_at = max(incumbent.last_seen_at, profile.last_seen_at)
-                    del self.current_profiles[existing_by_endpoint]
-                    self.current_profiles[canonical_key] = profile
-                    self.current_identity_map[profile.identity_key] = canonical_key
-                    self.current_endpoint_map[profile.endpoint_key] = canonical_key
-                return
+        existing_by_endpoint = self.current_endpoint_map.get(profile.endpoint_key)
+        if existing_by_endpoint and existing_by_endpoint in self.current_profiles:
+            incumbent = self.current_profiles[existing_by_endpoint]
+            if profile.replacement_priority() > incumbent.replacement_priority():
+                profile.first_seen_at = min(incumbent.first_seen_at, profile.first_seen_at)
+                profile.last_seen_at = max(incumbent.last_seen_at, profile.last_seen_at)
+                del self.current_profiles[existing_by_endpoint]
+                self.current_profiles[canonical_key] = profile
+                self.current_identity_map[profile.identity_key] = canonical_key
+                self.current_endpoint_map[profile.endpoint_key] = canonical_key
+            return
 
         self.current_profiles[canonical_key] = profile
         self.current_identity_map[profile.identity_key] = canonical_key
@@ -1462,20 +1284,11 @@ class Parser:
 
         logger.info('Объединение с 7-дневным реестром...')
         
-        # Получаем уровень дедупликации из переменной окружения
-        dedup_level = os.environ.get('DEDUP_LEVEL', 'medium').lower()
-        logger.info(f'Уровень дедупликации: {dedup_level}')
-        
-        # Применяем дедупликацию перед объединением с реестром
+        # Применяем дедупликацию перед объединением с реестром (базовая - только полные дубликаты)
         profiles_list = list(self.current_profiles.values())
-        profiles_deduped = apply_deduplication(profiles_list, dedup_level)
-        
-        # Обновляем current_profiles отфильтрованным списком
-        self.current_profiles = {p.canonical_key: p for p in profiles_deduped}
         
         self.registry.merge(self.current_profiles.values())
         self.stats['profiles_after_registry_merge'] = len(self.registry.profiles)
-        self.stats['dedup_level'] = dedup_level
 
         logger.info('Переоценка merged-профилей и каналов...')
         for profile in self.registry.profiles.values():
