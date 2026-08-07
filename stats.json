@@ -1,24 +1,20 @@
 {
   "input_subscriptions": 23,
   "loaded_subscriptions": 23,
-  "channels_found": 33,
-  "profiles_before_registry_merge": 47097,
-  "profiles_after_registry_merge": 47097,
+  "channels_found": 3554,
+  "profiles_before_registry_merge": 43799,
+  "profiles_after_registry_merge": 43799,
   "profiles_by_protocol": {
-    "vless": 40161,
-    "trojan": 3642,
-    "vmess": 1700,
-    "hy2": 737,
-    "ss": 853,
+    "vless": 39670,
+    "trojan": 3522,
+    "hy2": 603,
     "tuic": 4
   },
-  "speed_test_url": "https://speed.cloudflare.com/__down?bytes=102400",
+  "speed_test_url": "https://www.thinkbroadband.com/download/thinkbroadband_100k.bin",
   "speed_test_strategy": "tcp_probe",
-  "generated_at": "2026-08-07T04:28:29Z",
-  "reference_speed_test_url": "https://speed.cloudflare.com/__down?bytes=102400",
-  "reference_speed_test_bytes": 102400,
-  "reference_speed_test_kbps": 826.18,
-  "best_channels_count": 9,
-  "bad_channels_count": 24,
-  "window_started_at": "2026-08-07T04:26:50Z"
+  "generated_at": "2026-08-07T04:48:23Z",
+  "reference_speed_test_kbps": null,
+  "best_channels_count": 124,
+  "bad_channels_count": 3430,
+  "window_started_at": "2026-08-07T04:44:13Z"
 }
