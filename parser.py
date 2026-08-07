@@ -37,6 +37,11 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsp
 import aiohttp
 
 try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover
+    BeautifulSoup = None
+
+try:
     import config
 except ImportError:  # pragma: no cover
     config = None
@@ -75,6 +80,8 @@ MAX_CONCURRENT_SUBSCRIPTION_FETCHES = int(cfg('MAX_CONCURRENT_SUBSCRIPTION_FETCH
 MAX_CONCURRENT_TELEGRAM_FETCHES = int(cfg('MAX_CONCURRENT_TELEGRAM_FETCHES', 40))
 MAX_CONCURRENT_SPEED_TESTS = int(cfg('MAX_CONCURRENT_SPEED_TESTS', 150))
 TELEGRAM_MESSAGES_LIMIT = int(cfg('TELEGRAM_MESSAGES_LIMIT', 100))
+TELEGRAM_WEB_PREVIEW_ENABLED = bool(cfg('TELEGRAM_WEB_PREVIEW_ENABLED', True))
+TELEGRAM_WEB_PREVIEW_MAX_PAGES = int(cfg('TELEGRAM_WEB_PREVIEW_MAX_PAGES', 3))
 
 SPEED_TEST_URL = cfg('SPEED_TEST_URL', 'http://speedtest.tele2.net/100KB.zip')
 SPEED_TEST_FILE_SIZE_BYTES = int(cfg('SPEED_TEST_FILE_SIZE_BYTES', 102400))
@@ -82,6 +89,7 @@ SPEED_THRESHOLD_KBPS = float(cfg('SPEED_THRESHOLD_KBPS', 300.0))
 MAX_REPORTED_SPEED_KBPS = float(cfg('MAX_REPORTED_SPEED_KBPS', 5000.0))
 SPEED_TEST_STRATEGY = str(cfg('SPEED_TEST_STRATEGY', 'tcp_probe')).strip().lower()
 MIN_BASE_SCORE_FOR_SPEED_PRIORITY = float(cfg('MIN_BASE_SCORE_FOR_SPEED_PRIORITY', 45.0))
+SPEED_TEST_TOTAL_BUDGET_SECONDS = float(cfg('SPEED_TEST_TOTAL_BUDGET_SECONDS', 240.0))
 
 SUPPORTED_PROTOCOLS = {p.lower() for p in cfg('SUPPORTED_PROTOCOLS', ['vless', 'vmess', 'trojan', 'ss', 'ssr', 'tuic', 'hy2', 'hysteria', 'hysteria2'])}
 ALLOW_ONLY_IPV4 = bool(cfg('ALLOW_ONLY_IPV4', True))
@@ -770,27 +778,120 @@ class SubscriptionFetcher:
 
 
 class TelegramChannelFetcher:
-    ENDPOINTS = [
+    # Публичные JSON-зеркала Telegram-каналов. Пробуются по очереди — если одно
+    # недоступно (лимит/бан/даунтайм), используется следующее.
+    JSON_ENDPOINTS = [
         'https://tg.i-c-a.su/r/{channel}/{limit}',
+        'https://tg.i-c-a.su/json/{channel}/{limit}',
     ]
+    # Официальная публичная веб-версия Telegram-канала (t.me/s/<channel>).
+    # Не требует авторизации/API-ключей и работает для любого публичного канала.
+    # Используется как надёжный резервный путь, если JSON-зеркала недоступны.
+    WEB_PREVIEW_URL = 'https://t.me/s/{channel}'
+
+    HEADERS = {
+        'User-Agent': USER_AGENT,
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+    }
 
     @classmethod
     async def fetch_channel_messages(cls, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, channel: str) -> List[str]:
         cutoff = utcnow() - timedelta(days=PROFILE_WINDOW_DAYS)
-        messages: List[str] = []
         async with semaphore:
-            for endpoint in cls.ENDPOINTS:
-                url = endpoint.format(channel=channel, limit=TELEGRAM_MESSAGES_LIMIT)
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=TELEGRAM_FETCH_TIMEOUT)) as response:
-                        if response.status != 200:
-                            continue
-                        data = await response.json(content_type=None)
-                        messages = cls.extract_messages(data, cutoff)
-                        if messages:
-                            return messages
-                except Exception:
+            messages = await cls._fetch_via_json(session, channel, cutoff)
+            if messages:
+                return messages
+            if TELEGRAM_WEB_PREVIEW_ENABLED and BeautifulSoup is not None:
+                return await cls._fetch_via_web_preview(session, channel, cutoff)
+        return []
+
+    @classmethod
+    async def _fetch_via_json(cls, session: aiohttp.ClientSession, channel: str, cutoff: datetime) -> List[str]:
+        for endpoint in cls.JSON_ENDPOINTS:
+            url = endpoint.format(channel=channel, limit=TELEGRAM_MESSAGES_LIMIT)
+            try:
+                async with session.get(url, headers=cls.HEADERS, timeout=aiohttp.ClientTimeout(total=TELEGRAM_FETCH_TIMEOUT)) as response:
+                    if response.status != 200:
+                        continue
+                    data = await response.json(content_type=None)
+                    messages = cls.extract_messages(data, cutoff)
+                    if messages:
+                        return messages
+            except Exception:
+                continue
+        return []
+
+    @classmethod
+    async def _fetch_via_web_preview(cls, session: aiohttp.ClientSession, channel: str, cutoff: datetime) -> List[str]:
+        messages: List[str] = []
+        before_id: Optional[int] = None
+        for _ in range(max(TELEGRAM_WEB_PREVIEW_MAX_PAGES, 1)):
+            url = cls.WEB_PREVIEW_URL.format(channel=channel)
+            if before_id:
+                url = f'{url}?before={before_id}'
+            try:
+                async with session.get(url, headers=cls.HEADERS, timeout=aiohttp.ClientTimeout(total=TELEGRAM_FETCH_TIMEOUT)) as response:
+                    if response.status != 200:
+                        break
+                    html = await response.text(errors='ignore')
+            except Exception:
+                break
+
+            try:
+                soup = BeautifulSoup(html, 'html.parser')
+            except Exception:
+                break
+
+            wraps = soup.select('.tgme_widget_message_wrap')
+            if not wraps:
+                break
+
+            page_min_id: Optional[int] = None
+            reached_cutoff = False
+            for wrap in wraps:
+                msg = wrap.select_one('.tgme_widget_message')
+                if not msg:
                     continue
+
+                data_post = msg.get('data-post', '')
+                msg_id: Optional[int] = None
+                if '/' in data_post:
+                    try:
+                        msg_id = int(data_post.rsplit('/', 1)[-1])
+                    except Exception:
+                        msg_id = None
+                if msg_id is not None:
+                    page_min_id = msg_id if page_min_id is None else min(page_min_id, msg_id)
+
+                msg_dt: Optional[datetime] = None
+                time_tag = msg.select_one('.tgme_widget_message_date time')
+                if time_tag and time_tag.get('datetime'):
+                    try:
+                        raw_dt = time_tag['datetime'].replace('Z', '+00:00')
+                        msg_dt = datetime.fromisoformat(raw_dt).astimezone(timezone.utc).replace(tzinfo=None)
+                    except Exception:
+                        msg_dt = None
+
+                if msg_dt and msg_dt < cutoff:
+                    reached_cutoff = True
+                    continue
+
+                text_parts = []
+                text_tag = msg.select_one('.tgme_widget_message_text')
+                if text_tag:
+                    text_parts.append(text_tag.get_text('\n'))
+                for link_tag in msg.select('a[href]'):
+                    href = link_tag.get('href') or ''
+                    if href:
+                        text_parts.append(href)
+                text = '\n'.join(part.strip() for part in text_parts if part.strip())
+                if text:
+                    messages.append(text)
+
+            if reached_cutoff or page_min_id is None:
+                break
+            before_id = page_min_id
+
         return messages
 
     @staticmethod
@@ -844,8 +945,26 @@ class SpeedTester:
             logger.info('Speed-test отключён настройкой SPEED_TEST_STRATEGY=disabled')
             return
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_SPEED_TESTS)
-        tasks = [self._test_profile(semaphore, profile) for profile in profiles]
-        await asyncio.gather(*tasks)
+        profile_list = list(profiles)
+        tasks = [asyncio.ensure_future(self._test_profile(semaphore, profile)) for profile in profile_list]
+        if not tasks:
+            return
+        try:
+            # Общий бюджет времени на весь speed-test, чтобы при большом числе
+            # профилей (десятки тысяч) шаг не растягивался непредсказуемо
+            # долго. Профили, которые не успели проверить, просто получают
+            # speed_kbps=0 (без speed-бонуса) и остаются в списке.
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=SPEED_TEST_TOTAL_BUDGET_SECONDS)
+        except asyncio.TimeoutError:
+            remaining = sum(1 for t in tasks if not t.done())
+            logger.warning(
+                'Speed-test превысил бюджет времени %.0f сек — %s профилей из %s не были проверены (получат speed_kbps=0)',
+                SPEED_TEST_TOTAL_BUDGET_SECONDS, remaining, len(tasks),
+            )
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _test_profile(self, semaphore: asyncio.Semaphore, profile: ProtocolProfile) -> None:
         cache_key = f'{profile.host}:{profile.port}'
@@ -1112,6 +1231,8 @@ class Parser:
 
         self.stats['profiles_before_registry_merge'] = len(self.current_profiles)
 
+        await self.measure_reference_speed()
+
         logger.info('Быстрая speed-оценка профилей...')
         await self.speed_tester.evaluate_profiles(self.current_profiles.values())
 
@@ -1141,6 +1262,49 @@ class Parser:
         self.save_results()
         self.registry.save()
         logger.info('Готово')
+
+    async def measure_reference_speed(self) -> None:
+        """Разовая эталонная проверка через настоящий 100KB тестовый файл
+        (SPEED_TEST_URL). Она подтверждает, что методика speed-теста
+        действительно опирается на файл нужного размера, и попадает в
+        stats.json для прозрачности. Проверка каждого отдельного профиля
+        (десятки тысяч штук) выполняется быстрым TCP-probe (см. SpeedTester),
+        нормализованным под этот же эталонный размер — полноценный download
+        через каждый VLESS/VMess/Trojan/... профиль потребовал бы отдельного
+        proxy-клиента (xray/sing-box) на каждый профиль и был бы слишком
+        медленным для больших списков."""
+        candidate_urls = [SPEED_TEST_URL] + list(cfg('SPEED_TEST_FALLBACK_URLS', []))
+        connector = aiohttp.TCPConnector(ssl=False)
+        timeout = aiohttp.ClientTimeout(total=SUBSCRIPTION_FETCH_TIMEOUT)
+        for url in candidate_urls:
+            started = time.perf_counter()
+            try:
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.get(url, headers={'User-Agent': USER_AGENT}) as response:
+                        if response.status != 200:
+                            logger.debug('Эталонный speed-test: %s вернул HTTP %s', url, response.status)
+                            continue
+                        content = await response.read()
+                elapsed = max(time.perf_counter() - started, 0.001)
+                # Файл должен быть примерно ожидаемого размера (допускаем
+                # отклонение вниз до 50%, т.к. некоторые сервисы отдают чуть
+                # меньше/больше байт). Иначе это не полноценный тестовый файл
+                # (например, страница ошибки прокси/CDN), и такой замер
+                # отбрасывается, а пробуется следующий источник.
+                if len(content) < SPEED_TEST_FILE_SIZE_BYTES * 0.5:
+                    logger.debug('Эталонный speed-test: %s вернул только %s байт, пропускаем', url, len(content))
+                    continue
+                kbps = round((len(content) / 1024.0) / elapsed, 2)
+                self.stats['reference_speed_test_url'] = url
+                self.stats['reference_speed_test_bytes'] = len(content)
+                self.stats['reference_speed_test_kbps'] = kbps
+                logger.info('Эталонный speed-test: %s байт за %.1f мс (%s KB/s) — %s', len(content), elapsed * 1000.0, kbps, url)
+                return
+            except Exception as exc:
+                logger.debug('Эталонный speed-test не удался для %s: %s', url, exc)
+                continue
+        logger.warning('Эталонный speed-test не удался ни для одного из источников')
+        self.stats['reference_speed_test_kbps'] = None
 
     async def process_telegram_channels(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False, limit=MAX_CONCURRENT_TELEGRAM_FETCHES)
