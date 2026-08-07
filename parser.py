@@ -32,7 +32,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit, urlparse, parse_qs
 
 import aiohttp
 
@@ -48,6 +48,107 @@ except ImportError:  # pragma: no cover
 
 
 # =============================================================================
+# ВСТРОЕННЫЙ МОДУЛЬ ДЕДУПЛИКАЦИИ (dedup.py)
+# =============================================================================
+
+def _dedup_normalize_profile(uri):
+    """Нормализует профиль для дедупликации (без вреда для качества)."""
+    if not uri or not isinstance(uri, str):
+        return None
+
+    uri = uri.strip()
+    if not re.match(r'^(vless|vmess|trojan|ssr|ss|hysteria2?|tuic)://', uri, re.IGNORECASE):
+        return None
+
+    try:
+        base_uri = uri.split('#')[0]
+
+        if base_uri.lower().startswith('vmess://'):
+            try:
+                decoded = base64.b64decode(base_uri[8:] + '==').decode('utf-8')
+                config_vmess = json.loads(decoded)
+                key = f"vmess|{config_vmess.get('add','').lower()}|{config_vmess.get('port')}|{config_vmess.get('id','').lower()}|{config_vmess.get('net')}|{config_vmess.get('tls')}"
+                return key
+            except Exception:
+                return None
+
+        if base_uri.lower().startswith('ss://'):
+            try:
+                if '@' in base_uri:
+                    user_info, host_info = base_uri[5:].split('@', 1)
+                    if not host_info.startswith('http'):
+                        host_info = '//' + host_info
+                    parsed = urlparse(host_info)
+                    host = parsed.hostname
+                    port = parsed.port
+                    if ':' not in user_info:
+                        user_info = base64.b64decode(user_info + '==').decode('utf-8')
+                    method, _, password = user_info.partition(':')
+                    return f"ss|{host.lower()}|{port}|{method}|{password}"
+            except Exception:
+                return None
+
+        parsed = urlparse(base_uri)
+        host = parsed.hostname
+        if not host:
+            return None
+
+        port = parsed.port or (443 if parsed.scheme.lower() in ['vless', 'trojan'] else 80)
+        password = unquote(parsed.username or '')
+
+        query = parse_qs(parsed.query)
+        important_params = ['type', 'host', 'path', 'security', 'sni', 'fp', 'pbk', 'sid', 'sps']
+        query_str = "&".join(f"{k}={query[k][0]}" for k in important_params if k in query)
+
+        return f"{parsed.scheme.lower()}|{host.lower()}|{port}|{password}|{query_str}"
+
+    except Exception:
+        return None
+
+
+def _dedup_get_host_port(uri):
+    """Извлекает хост и порт для жесткой дедупликации по IP/Домену."""
+    norm = _dedup_normalize_profile(uri)
+    if norm:
+        parts = norm.split('|')
+        if len(parts) >= 3:
+            return f"{parts[1]}:{parts[2]}"
+    return None
+
+
+def aggressive_deduplicate(profiles):
+    """Применяет все возможные фильтры для сокращения объема профилей."""
+    initial_count = len(profiles)
+    logger.info(f"Запуск глубокой дедупликации. Исходное количество: {initial_count}")
+
+    unique_profiles = {}
+    seen_host_port = set()
+
+    for p in profiles:
+        key = _dedup_normalize_profile(p)
+        if not key:
+            continue
+
+        if key in unique_profiles:
+            continue
+
+        hp = _dedup_get_host_port(p)
+        if hp and hp in seen_host_port:
+            continue
+
+        if hp:
+            seen_host_port.add(hp)
+
+        unique_profiles[key] = p
+
+    final_profiles = list(unique_profiles.values())
+    final_count = len(final_profiles)
+    logger.info(f"Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
+
+    return final_profiles
+
+
+# =============================================================================
 # НАСТРОЙКИ
 # =============================================================================
 
@@ -56,7 +157,7 @@ def cfg(name: str, default: Any) -> Any:
 
 
 OUTPUT_DIR = cfg('OUTPUT_DIR', 'output')
-WRITE_MIRROR_FILES_TO_ROOT = cfg('WRITE_MIRROR_FILES_TO_ROOT', True)
+WRITE_MIRROR_FILES_TO_ROOT = cfg('WRITE_MIRROR_FILES_TO_ROOT', False)
 OUTPUT_ENCODING = cfg('OUTPUT_ENCODING', 'utf-8')
 
 LOG_LEVEL = cfg('LOG_LEVEL', 'INFO')
@@ -1216,12 +1317,23 @@ class Parser:
         self.stats['loaded_subscriptions'] = len(self.subscriptions)
 
         logger.info('Извлечение профилей и Telegram-каналов из подписок...')
+        all_profiles_raw = []
         for content in self.subscriptions.values():
             if EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS:
                 for profile in ProtocolParser.extract_protocols(content):
-                    self.register_profile(profile)
+                    all_profiles_raw.append(profile.render_for_output())
             for lower, original in ProtocolParser.extract_telegram_channels(content).items():
                 self.channels.setdefault(lower, TelegramChannel(username=original, url=f'https://t.me/{original}'))
+
+        # Применяем агрессивную дедупликацию к сырым профилям
+        logger.info('Применение агрессивной дедупликации (dedup.py)...')
+        deduplicated_raw = aggressive_deduplicate(all_profiles_raw)
+        
+        # Парсим дедуплицированные профили обратно в объекты ProtocolProfile
+        for raw_profile in deduplicated_raw:
+            profile_obj = ProtocolParser.parse(raw_profile)
+            if profile_obj:
+                self.register_profile(profile_obj)
 
         self.stats['channels_found'] = len(self.channels)
         logger.info('Найдено каналов: %s', len(self.channels))
