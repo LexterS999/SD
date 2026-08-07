@@ -1,6 +1,5 @@
 # Плохие Telegram-каналы (не прошли порог quality_score < 20.0)
 # Период сбора данных: 7 дн.
-# Дата генерации: 2026-08-07T13:11:40Z
+# Дата генерации: 2026-08-07T13:50:13Z
 # Формат: URL канала | quality_score | profiles_count | protocols_found
 
-https://t.me/limevpnfree | score:0.00 | profiles:0 | protocols:[none]
