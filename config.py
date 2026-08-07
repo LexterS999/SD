@@ -49,10 +49,22 @@ BANNED_DOMAINS = [
 ALLOW_ONLY_IPV4 = True
 
 # Максимальное количество уникальных профилей для сохранения (0 = без ограничений).
-MAX_UNIQUE_PROFILES = 5000
+MAX_UNIQUE_PROFILES = 2000
 
 # Собирать профили только из хороших каналов (quality_score >= BAD_CHANNELS_THRESHOLD).
 ONLY_FROM_GOOD_CHANNELS = True
+
+# Использовать хэширование профилей для дедупликации (md5 от канонического ключа).
+USE_PROFILE_HASHING = True
+
+# Удалять профили с одинаковым endpoint (IP + port), оставляя только лучший.
+DEDUPLICATE_BY_ENDPOINT = True
+
+# Минимальный балл качества профиля для сохранения.
+MIN_PROFILE_QUALITY_SCORE = 50.0
+
+# Минимальная скорость загрузки (KB/s) для сохранения профиля.
+MIN_PROFILE_SPEED_KBPS = 300.0
 
 
 # =============================================
