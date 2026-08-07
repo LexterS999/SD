@@ -22,13 +22,14 @@ on:
       - 'parser.py'
       - 'requirements.txt'
       - 'input.txt'
+      - 'dedup.py'
 
 env:
   PYTHON_VERSION: '3.11'
 
 jobs:
-  parse-subscriptions:
-    name: Парсинг подписок и Telegram-каналов
+  parse:
+    name: Парсинг
     runs-on: ubuntu-latest
     
     steps:
@@ -56,7 +57,7 @@ jobs:
           fi
           echo "Найдено $(wc -l < input.txt) подписок для обработки"
       
-      - name: Запуск парсера
+      - name: Запуск парсера с дедупликацией
         run: |
           echo "Запуск парсера..."
           python parser.py
@@ -74,6 +75,13 @@ jobs:
             echo "  Количество каналов: $(grep -c '^\[' best_channels.txt || echo 0)"
           else
             echo "✗ Файл best_channels.txt не создан"
+          fi
+          
+          # Вывод статистики дедупликации из лога
+          if [ -f parser.log ]; then
+            echo ""
+            echo "=== Статистика дедупликации ==="
+            grep -i "дедупликация\|Дедупликация" parser.log || true
           fi
       
       - name: Сохранение артефактов
@@ -126,7 +134,7 @@ jobs:
             - Найдено профилей: $(cat stats.json 2>/dev/null | grep total_profiles | grep -o '[0-9]*' || echo "N/A")
             
             ### Файлы:
-            - `protocols.txt` - Уникальные профили протоколов
+            - `protocols.txt` - Уникальные профили протоколов (после дедупликации)
             - `best_channels.txt` - Лучшие Telegram-каналы
             - `stats.json` - Статистика запуска
           files: |
@@ -136,21 +144,17 @@ jobs:
           fail_on_error: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  
-  notify:
-    name: Уведомление о завершении
-    runs-on: ubuntu-latest
-    needs: parse-subscriptions
-    if: always()
-    
-    steps:
-      - name: Статус выполнения
+      
+      - name: Уведомление о завершении
+        if: always()
         run: |
-          if [ "${{ needs.parse-subscriptions.result }}" == "success" ]; then
+          echo "==================================="
+          if [ "${{ job.status }}" == "success" ]; then
             echo "✅ Парсинг успешно завершен"
-          elif [ "${{ needs.parse-subscriptions.result }}" == "failure" ]; then
+          elif [ "${{ job.status }}" == "failure" ]; then
             echo "❌ Парсинг завершился с ошибкой"
             exit 1
           else
             echo "⚠️ Парсинг был пропущен или отменен"
           fi
+          echo "==================================="
