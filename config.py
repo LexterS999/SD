@@ -244,7 +244,7 @@ PROFILE_WEIGHTS = {
 
 # Веса скоринга Telegram-каналов.
 CHANNEL_WEIGHTS = {
-    'profile_count': 0.35,
+    'profile_count': 0.50,  # Увеличен вес количества профилей для каналов
     'protocol_diversity': 0.25,
     'freshness': 0.20,
     'validity': 0.20,
@@ -273,7 +273,7 @@ TG_PATTERNS = [
 
 # Включать ли прямой сбор профилей из самих подписок.
 # Если False — подписки используются только как источник ссылок на Telegram-каналы.
-EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS = True
+EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS = False  # Профили только из Telegram-каналов, не из подписок
 
 # Дополнительная сверхжёсткая дедупликация: оставлять только один лучший профиль
 # на комбинацию protocol + IPv4 + port. Полезно, когда один и тот же endpoint
@@ -310,4 +310,6 @@ PROFILE_TAG_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789'
 9. Выполняет быструю speed-проверку на базе малого 100KB test-file сценария.
 10. Сортирует профили так, чтобы быстрые профили поднимались выше, если у них
     уже достаточно хороший базовый балл по другим критериям.
+"""
+�ям.
 """
