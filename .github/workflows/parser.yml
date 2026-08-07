@@ -2,15 +2,11 @@ name: Парсинг
 
 on:
   schedule:
-    - cron: '0 * * * *' # Запуск каждый час (настрой при необходимости)
+    - cron: '0 */3 * * *' # Запуск каждые 3 часа
   workflow_dispatch:
-  push:
-    branches: [main, master]
-    paths:
-      - 'parser.py'
-      - 'requirements.txt'
-      - 'input.txt'
-      - 'config.py'
+
+permissions:
+  contents: write
 
 jobs:
   parse_and_notify:
