@@ -29,10 +29,13 @@ import os
 import random
 import re
 import shutil
+import socket
+import statistics
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit, urlparse, parse_qs
 
 import aiohttp
@@ -76,14 +79,18 @@ BAD_CHANNELS_FILE_NAME = cfg('BAD_CHANNELS_FILE', 'bad_channels.txt')
 STATS_FILE_NAME = cfg('STATS_FILE', 'stats.json')
 PROTOCOLS_STATE_FILE_NAME = cfg('PROTOCOLS_STATE_FILE', 'protocols_state.json')
 CHANNELS_STATE_FILE_NAME = cfg('CHANNELS_STATE_FILE', 'channels_state.json')
+CHANNELS_HISTORY_FILE_NAME = cfg('CHANNELS_HISTORY_FILE', 'channels_history.json')
+CHANGES_REPORT_FILE_NAME = cfg('CHANGES_REPORT_FILE', 'changes_report.json')
 
 USER_AGENT = cfg('USER_AGENT', 'Mozilla/5.0')
 SUBSCRIPTION_FETCH_TIMEOUT = float(cfg('SUBSCRIPTION_FETCH_TIMEOUT', 25))
 TELEGRAM_FETCH_TIMEOUT = float(cfg('TELEGRAM_FETCH_TIMEOUT', 12))
 TCP_CHECK_TIMEOUT = float(cfg('TCP_CHECK_TIMEOUT', 3.0))
+HTTP_CHECK_TIMEOUT = float(cfg('HTTP_CHECK_TIMEOUT', 5.0))
 MAX_CONCURRENT_SUBSCRIPTION_FETCHES = int(cfg('MAX_CONCURRENT_SUBSCRIPTION_FETCHES', 20))
 MAX_CONCURRENT_TELEGRAM_FETCHES = int(cfg('MAX_CONCURRENT_TELEGRAM_FETCHES', 40))
 MAX_CONCURRENT_TCP_CHECKS = int(cfg('MAX_CONCURRENT_TCP_CHECKS', 150))
+MAX_CONCURRENT_DNS_LOOKUPS = int(cfg('MAX_CONCURRENT_DNS_LOOKUPS', 50))
 TELEGRAM_MESSAGES_LIMIT = int(cfg('TELEGRAM_MESSAGES_LIMIT', 100))
 TELEGRAM_WEB_PREVIEW_ENABLED = bool(cfg('TELEGRAM_WEB_PREVIEW_ENABLED', True))
 TELEGRAM_WEB_PREVIEW_MAX_PAGES = int(cfg('TELEGRAM_WEB_PREVIEW_MAX_PAGES', 3))
@@ -91,6 +98,43 @@ TELEGRAM_WEB_PREVIEW_MAX_PAGES = int(cfg('TELEGRAM_WEB_PREVIEW_MAX_PAGES', 3))
 # Настройки TCP/HTTP проверки
 TCP_CHECK_TIMEOUT = float(cfg('TCP_CHECK_TIMEOUT', 5.0))
 TCP_CHECK_ENABLED = bool(cfg('TCP_CHECK_ENABLED', os.environ.get('TCP_CHECK_ENABLED', 'true').lower() == 'true'))
+HTTP_CHECK_ENABLED = bool(cfg('HTTP_CHECK_ENABLED', False))
+TCP_MULTI_LEVEL_ENABLED = bool(cfg('TCP_MULTI_LEVEL_ENABLED', True))
+
+# Настройки DNS кэширования
+DNS_CACHE_TTL = int(cfg('DNS_CACHE_TTL', 3600))
+DNS_CACHE_ENABLED = bool(cfg('DNS_CACHE_ENABLED', True))
+
+# Настройки Reality-валидации
+REALITY_REQUIRED_KEYS = {'pbk', 'sid', 'sni'}
+REALITY_STRICT_MODE = bool(cfg('REALITY_STRICT_MODE', True))
+
+# Настройки для динамического порога
+BAD_CHANNELS_THRESHOLD_MIN = float(cfg('BAD_CHANNELS_THRESHOLD_MIN', 10.0))
+BAD_CHANNELS_THRESHOLD_MAX = float(cfg('BAD_CHANNELS_THRESHOLD_MAX', 50.0))
+BAD_CHANNELS_THRESHOLD = float(cfg('BAD_CHANNELS_THRESHOLD', 20.0))
+
+# Настройки для обнаружения аномалий
+ANOMALY_DETECTION_ENABLED = bool(cfg('ANOMALY_DETECTION_ENABLED', True))
+ANOMALY_STDDEV_THRESHOLD = float(cfg('ANOMALY_STDDEV_THRESHOLD', 2.5))
+
+# Настройки для RL и предиктивной модели
+RL_ENABLED = bool(cfg('RL_ENABLED', False))
+PREDICTIVE_MODEL_ENABLED = bool(cfg('PREDICTIVE_MODEL_ENABLED', False))
+
+# Настройки автокалибровки весов
+AUTO_CALIBRATE_WEIGHTS = bool(cfg('AUTO_CALIBRATE_WEIGHTS', False))
+
+# Настройки для географического разнообразия
+GEO_DIVERSITY_ENABLED = bool(cfg('GEO_DIVERSITY_ENABLED', False))
+MAX_PROFILES_PER_COUNTRY = int(cfg('MAX_PROFILES_PER_COUNTRY', 50))
+
+# Настройки для кластеризации по подсетям
+SUBNET_CLUSTERING_ENABLED = bool(cfg('SUBNET_CLUSTERING_ENABLED', True))
+MAX_PROFILES_PER_SUBNET_24 = int(cfg('MAX_PROFILES_PER_SUBNET_24', 10))
+
+# Настройки для проверки UUID
+UUID_CHECK_ENABLED = bool(cfg('UUID_CHECK_ENABLED', True))
 
 SUPPORTED_PROTOCOLS = {p.lower() for p in cfg('SUPPORTED_PROTOCOLS', ['vless', 'vmess', 'trojan', 'ss', 'ssr', 'tuic', 'hy2', 'hysteria', 'hysteria2'])}
 ALLOW_ONLY_IPV4 = bool(cfg('ALLOW_ONLY_IPV4', True))
@@ -100,8 +144,8 @@ IP_LIKE_QUERY_KEYS = {str(x).lower() for x in cfg('IP_LIKE_QUERY_KEYS', ['ip', '
 IGNORED_QUERY_KEYS = {str(x).lower() for x in cfg('IGNORED_QUERY_KEYS', [])}
 IGNORED_VMESS_KEYS = {str(x).lower() for x in cfg('IGNORED_VMESS_KEYS', [])}
 
-BAD_CHANNELS_THRESHOLD = float(cfg('BAD_CHANNELS_THRESHOLD', 20.0))
 STANDARD_PORTS = {str(x) for x in cfg('STANDARD_PORTS', ['443', '80', '8443', '2053', '2083', '2087', '2096', '8080'])}
+NON_STANDARD_PORT_BONUS = float(cfg('NON_STANDARD_PORT_BONUS', 5.0))
 SUSPICIOUS_HOST_PARTS = tuple(str(x).lower() for x in cfg('SUSPICIOUS_HOST_PARTS', []))
 PROFILE_WEIGHTS = dict(cfg('PROFILE_WEIGHTS', {}))
 CHANNEL_WEIGHTS = dict(cfg('CHANNEL_WEIGHTS', {}))
@@ -111,14 +155,32 @@ EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS = bool(cfg('EXTRACT_DIRECT_PROFILES_F
 PROFILE_TAG_LENGTH = int(cfg('PROFILE_TAG_LENGTH', 7))
 PROFILE_TAG_ALPHABET = str(cfg('PROFILE_TAG_ALPHABET', 'abcdefghijklmnopqrstuvwxyz0123456789'))
 
+# Стандартные пути для бонуса
+STANDARD_PATHS = {'/', '/websocket', '/ws', '/ray', '/vless', '/trojan', ''}
+STANDARD_PATH_BONUS = float(cfg('STANDARD_PATH_BONUS', 3.0))
+
+# Максимальное количество query-параметров без штрафа
+MAX_QUERY_PARAMS_NO_PENALTY = int(cfg('MAX_QUERY_PARAMS_NO_PENALTY', 8))
+QUERY_PARAM_PENALTY = float(cfg('QUERY_PARAM_PENALTY', 1.0))
+
+# Современные ALPN для бонуса
+MODERN_ALPN = {'h3', 'h2', 'http/2', 'http/3'}
+MODERN_ALPN_BONUS = float(cfg('MODERN_ALPN_BONUS', 5.0))
+
+# Минимальная длина credential
+MIN_CREDENTIAL_LENGTH = int(cfg('MIN_CREDENTIAL_LENGTH', 8))
+CREDENTIAL_LENGTH_BONUS = float(cfg('CREDENTIAL_LENGTH_BONUS', 3.0))
+
 PROTOCOLS_FILE = os.path.join(OUTPUT_DIR, PROTOCOLS_FILE_NAME)
 BEST_CHANNELS_FILE = os.path.join(OUTPUT_DIR, BEST_CHANNELS_FILE_NAME)
 BAD_CHANNELS_FILE = os.path.join(OUTPUT_DIR, BAD_CHANNELS_FILE_NAME)
 STATS_FILE = os.path.join(OUTPUT_DIR, STATS_FILE_NAME)
 PROTOCOLS_STATE_FILE = os.path.join(OUTPUT_DIR, PROTOCOLS_STATE_FILE_NAME)
 CHANNELS_STATE_FILE = os.path.join(OUTPUT_DIR, CHANNELS_STATE_FILE_NAME)
+CHANNELS_HISTORY_FILE = os.path.join(OUTPUT_DIR, CHANNELS_HISTORY_FILE_NAME)
+CHANGES_REPORT_FILE = os.path.join(OUTPUT_DIR, CHANGES_REPORT_FILE_NAME)
 
-REGISTRY_VERSION = 2
+REGISTRY_VERSION = 3
 DECORATIVE_KEYS = {'title', 'name', 'ps', 'remark', 'remarks', 'description', 'tag'}
 HYSTERIA_SCHEMES = {'hy2', 'hysteria', 'hysteria2'}
 
@@ -319,8 +381,19 @@ class ProtocolProfile:
     quality_score: float = 0.0
     base_score: float = 0.0
     tcp_rtt_ms: float = 0.0
+    tcp_rtt_jitter: float = 0.0  # Стандартное отклонение RTT (jitter)
     tcp_check_passed: bool = True
-
+    http_check_passed: bool = False
+    historical_score: float = 0.0  # Приоритизация по historical score
+    activity_history: List[float] = field(default_factory=list)  # История активности для метрики стабильности
+    predicted_lifetime_hours: float = 0.0  # Предиктивная модель жизнеспособности
+    asn_info: Optional[str] = None  # ASN информация
+    country_code: Optional[str] = None  # Код страны
+    ptr_record: Optional[str] = None  # Обратный DNS-запрос (PTR)
+    server_family_id: Optional[str] = None  # Идентификатор семейства серверов
+    subnet_24: Optional[str] = None  # Подсеть /24 для кластеризации
+    uuid_value: Optional[str] = None  # UUID для проверки уникальности
+    
     @property
     def canonical_key(self) -> str:
         return sha256_text(self.canonical_config)
@@ -345,7 +418,7 @@ class ProtocolProfile:
 
     def replacement_priority(self) -> Tuple[float, float, int, int, int]:
         return (
-            self.base_score,
+            self.base_score + self.historical_score,
             -self.tcp_rtt_ms if self.tcp_check_passed else 0,
             self.metadata_richness(),
             len(self.credential),
@@ -391,44 +464,161 @@ class QualityEvaluator:
         if is_public_ipv4(profile.host):
             score += float(PROFILE_WEIGHTS.get('ipv4_public', 15.0))
 
+        # Бонус за стандартные порты (уже есть) и штраф за нестандартные
         if profile.port in STANDARD_PORTS:
             score += float(PROFILE_WEIGHTS.get('standard_port', 8.0))
+        else:
+            # Бонус за нестандартный порт (может быть полезен для обхода блокировок)
+            score += NON_STANDARD_PORT_BONUS
 
         richness_bonus = min(profile.metadata_richness(), 12)
         score += min(richness_bonus, float(PROFILE_WEIGHTS.get('metadata_richness', 12.0)))
 
-        clean_query_bonus = float(PROFILE_WEIGHTS.get('query_cleanliness', 10.0))
-        if '?' not in profile.canonical_config:
-            score += clean_query_bonus * 0.4
+        # Анализ query-параметров
+        query_params_count = len(profile.metadata.get('query', {}))
+        if query_params_count <= MAX_QUERY_PARAMS_NO_PENALTY:
+            clean_query_bonus = float(PROFILE_WEIGHTS.get('query_cleanliness', 10.0))
+            if '?' not in profile.canonical_config:
+                score += clean_query_bonus * 0.4
+            else:
+                score += clean_query_bonus
         else:
-            score += clean_query_bonus
+            # Штраф за избыточные query-параметры
+            excess_params = query_params_count - MAX_QUERY_PARAMS_NO_PENALTY
+            score -= excess_params * QUERY_PARAM_PENALTY
 
         if channel_protocols:
             diversity = min(len(channel_protocols), 5)
             score += min(diversity * 2.0, float(PROFILE_WEIGHTS.get('channel_protocol_diversity', 10.0)))
 
+        # Бонус за стандартные пути
+        path = profile.metadata.get('path', '')
+        if path in STANDARD_PATHS:
+            score += STANDARD_PATH_BONUS
+
+        # Вес за современные ALPN (h3/h2)
+        alpn = profile.metadata.get('alpn', '')
+        if alpn:
+            alpn_set = set(alpn.lower().split(','))
+            modern_alpn_found = alpn_set & MODERN_ALPN
+            if modern_alpn_found:
+                score += MODERN_ALPN_BONUS * len(modern_alpn_found)
+
+        # Анализ длины credential
+        cred_len = len(profile.credential)
+        if cred_len >= MIN_CREDENTIAL_LENGTH:
+            score += CREDENTIAL_LENGTH_BONUS
+
+        # Строгая валидация Reality-параметров (pbk, sid, sni)
+        if REALITY_STRICT_MODE and profile.protocol == 'vless':
+            flow = profile.metadata.get('flow', '')
+            security = profile.metadata.get('security', '')
+            if security == 'reality' or flow == 'xtls-rprx-vision':
+                reality_keys = {'pbk', 'sid', 'sni'}
+                query = profile.metadata.get('query', {})
+                missing_keys = reality_keys - set(k.lower() for k in query.keys())
+                if missing_keys:
+                    # Критический штраф за отсутствие Reality-параметров
+                    score -= 30.0
+
         return round(min(score, 75.0), 2)
 
     @staticmethod
-    def apply_tcp_rtt_bonus(base_score: float, tcp_rtt_ms: float, tcp_check_passed: bool) -> float:
+    def apply_tcp_rtt_bonus(base_score: float, tcp_rtt_ms: float, tcp_check_passed: bool, tcp_rtt_jitter: float = 0.0) -> float:
         rtt_weight = float(PROFILE_WEIGHTS.get('tcp_rtt_bonus', 25.0))
         if not tcp_check_passed or tcp_rtt_ms <= 0:
             return 0.0
         # Чем меньше RTT, тем выше бонус (максимум при RTT <= 100мс)
         if tcp_rtt_ms <= 100:
-            return round(rtt_weight, 2)
-        # Плавное уменьшение бонуса с ростом RTT
-        max_rtt_for_bonus = 1000.0  # Максимальный RTT для получения бонуса
-        if tcp_rtt_ms >= max_rtt_for_bonus:
-            return round(rtt_weight * 0.1, 2)
-        return round((1 - (tcp_rtt_ms - 100) / (max_rtt_for_bonus - 100)) * rtt_weight, 2)
+            base_bonus = rtt_weight
+        else:
+            # Плавное уменьшение бонуса с ростом RTT
+            max_rtt_for_bonus = 1000.0  # Максимальный RTT для получения бонуса
+            if tcp_rtt_ms >= max_rtt_for_bonus:
+                base_bonus = rtt_weight * 0.1
+            else:
+                base_bonus = (1 - (tcp_rtt_ms - 100) / (max_rtt_for_bonus - 100)) * rtt_weight
+        
+        # Штраф за высокий jitter (нестабильность соединения)
+        jitter_penalty = 0.0
+        if tcp_rtt_jitter > 0:
+            if tcp_rtt_jitter > 100:  # Высокий jitter
+                jitter_penalty = rtt_weight * 0.3
+            elif tcp_rtt_jitter > 50:  # Средний jitter
+                jitter_penalty = rtt_weight * 0.15
+            elif tcp_rtt_jitter > 20:  # Низкий jitter
+                jitter_penalty = rtt_weight * 0.05
+        
+        return round(max(0, base_bonus - jitter_penalty), 2)
+
+    @staticmethod
+    def apply_historical_score(profile: ProtocolProfile) -> float:
+        """Приоритизация каналов по historical score на основе истории активности."""
+        if not profile.activity_history:
+            return 0.0
+        
+        # Вычисляем среднюю активность
+        avg_activity = sum(profile.activity_history) / len(profile.activity_history)
+        
+        # Вычисляем тренд (увеличивается или уменьшается активность)
+        if len(profile.activity_history) >= 2:
+            trend = profile.activity_history[-1] - profile.activity_history[0]
+            trend_bonus = max(0, trend * 0.1)  # Положительный тренд дает бонус
+        else:
+            trend_bonus = 0.0
+        
+        # Стабильность (обратная величина от стандартного отклонения)
+        if len(profile.activity_history) >= 2:
+            try:
+                stddev = statistics.stdev(profile.activity_history)
+                stability_bonus = max(0, 10.0 - stddev * 0.5)
+            except statistics.StatisticsError:
+                stability_bonus = 5.0
+        else:
+            stability_bonus = 5.0
+        
+        return round(avg_activity * 0.5 + trend_bonus + stability_bonus, 2)
+
+    @classmethod
+    def apply_anomaly_detection(cls, profiles: List[ProtocolProfile]) -> Set[str]:
+        """Обнаружение аномалий - статистический метод для выброса аномальных профилей."""
+        if not ANOMALY_DETECTION_ENABLED or len(profiles) < 5:
+            return set()
+        
+        anomalous_keys: Set[str] = set()
+        
+        # Собираем метрики для анализа
+        rtt_values = [p.tcp_rtt_ms for p in profiles if p.tcp_check_passed and p.tcp_rtt_ms > 0]
+        
+        if len(rtt_values) >= 5:
+            try:
+                mean_rtt = statistics.mean(rtt_values)
+                stddev_rtt = statistics.stdev(rtt_values)
+                
+                # Профили с RTT за пределами ANOMALY_STDDEV_THRESHOLD стандартных отклонений
+                for profile in profiles:
+                    if profile.tcp_check_passed and profile.tcp_rtt_ms > 0:
+                        z_score = abs(profile.tcp_rtt_ms - mean_rtt) / stddev_rtt if stddev_rtt > 0 else 0
+                        if z_score > ANOMALY_STDDEV_THRESHOLD:
+                            anomalous_keys.add(profile.canonical_key)
+            except statistics.StatisticsError:
+                pass
+        
+        return anomalous_keys
 
     @classmethod
     def finalize_profile(cls, profile: ProtocolProfile, channel_protocols: Optional[Dict[str, int]] = None) -> float:
         base_score = cls.evaluate_profile_base(profile, channel_protocols)
         profile.base_score = base_score
-        bonus = cls.apply_tcp_rtt_bonus(base_score, profile.tcp_rtt_ms, profile.tcp_check_passed)
-        profile.quality_score = round(min(base_score + bonus, 100.0), 2)
+        
+        # Применяем TCP RTT бонус с учетом jitter
+        bonus = cls.apply_tcp_rtt_bonus(base_score, profile.tcp_rtt_ms, profile.tcp_check_passed, profile.tcp_rtt_jitter)
+        
+        # Применяем historical score
+        historical_score = cls.apply_historical_score(profile)
+        profile.historical_score = historical_score
+        
+        profile.quality_score = round(min(base_score + bonus + historical_score, 100.0), 2)
         return profile.quality_score
 
     @staticmethod
@@ -483,6 +673,30 @@ class QualityEvaluator:
             + protocol_coverage * float(CHANNEL_WEIGHTS.get('protocol_coverage', 0.10))
         )
         return round(total * 100.0, 2)
+    
+    @staticmethod
+    def calculate_dynamic_bad_channels_threshold(channels: List[TelegramChannel]) -> float:
+        """Динамический BAD_CHANNELS_THRESHOLD на основе распределения scores."""
+        if not channels or len(channels) < 3:
+            return BAD_CHANNELS_THRESHOLD
+        
+        scores = [c.quality_score for c in channels if c.quality_score > 0]
+        if not scores:
+            return BAD_CHANNELS_THRESHOLD
+        
+        try:
+            median_score = statistics.median(scores)
+            stddev = statistics.stdev(scores) if len(scores) > 1 else 0
+            
+            # Динамический порог: медиана минус одно стандартное отклонение
+            dynamic_threshold = median_score - stddev
+            
+            # Ограничиваем диапазон
+            dynamic_threshold = max(BAD_CHANNELS_THRESHOLD_MIN, min(BAD_CHANNELS_THRESHOLD_MAX, dynamic_threshold))
+            
+            return round(dynamic_threshold, 2)
+        except statistics.StatisticsError:
+            return BAD_CHANNELS_THRESHOLD
 
 
 # =============================================================================
@@ -962,13 +1176,38 @@ class TelegramChannelFetcher:
 
 
 # =============================================================================
-# TCP RTT CHECKER
+# TCP RTT CHECKER (МНОГОУРОВНЕВЫЙ С КЭШИРОВАНИЕМ И HTTP ПРОВЕРКОЙ)
 # =============================================================================
+
+class DNSCache:
+    """Кэширование DNS-запросов."""
+    
+    def __init__(self, ttl_seconds: int = DNS_CACHE_TTL):
+        self.cache: Dict[str, Tuple[List[str], float]] = {}
+        self.ttl = ttl_seconds
+    
+    def get(self, hostname: str) -> Optional[List[str]]:
+        if not DNS_CACHE_ENABLED:
+            return None
+        cached = self.cache.get(hostname)
+        if cached and time.time() < cached[1]:
+            return cached[0]
+        if cached:
+            del self.cache[hostname]
+        return None
+    
+    def set(self, hostname: str, ips: List[str]) -> None:
+        if not DNS_CACHE_ENABLED:
+            return
+        self.cache[hostname] = (ips, time.time() + self.ttl)
+
 
 class TCPChecker:
     def __init__(self) -> None:
-        self.cache: Dict[str, Tuple[float, bool]] = {}
-
+        self.tcp_cache: Dict[str, Tuple[float, bool, float]] = {}  # host:port -> (rtt, passed, jitter)
+        self.dns_cache = DNSCache()
+        self.rtt_history: Dict[str, List[float]] = defaultdict(list)  # Для вычисления jitter
+    
     async def check_profiles(self, profiles: Iterable[ProtocolProfile]) -> None:
         if not TCP_CHECK_ENABLED:
             logger.info('TCP проверка отключена настройкой TCP_CHECK_ENABLED=false')
@@ -986,21 +1225,27 @@ class TCPChecker:
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-
+    
     async def _check_profile(self, semaphore: asyncio.Semaphore, profile: ProtocolProfile) -> None:
         cache_key = f'{profile.host}:{profile.port}'
-        cached = self.cache.get(cache_key)
+        cached = self.tcp_cache.get(cache_key)
         if cached:
-            profile.tcp_rtt_ms, profile.tcp_check_passed = cached
+            profile.tcp_rtt_ms, profile.tcp_check_passed, profile.tcp_rtt_jitter = cached
             return
-
+        
         async with semaphore:
-            rtt_ms, passed = await self._tcp_ping(profile.host, int(profile.port))
-            self.cache[cache_key] = (rtt_ms, passed)
+            rtt_ms, passed, jitter = await self._tcp_ping_multi_level(profile.host, int(profile.port))
+            self.tcp_cache[cache_key] = (rtt_ms, passed, jitter)
             profile.tcp_rtt_ms = rtt_ms
             profile.tcp_check_passed = passed
-
+            profile.tcp_rtt_jitter = jitter
+            
+            # HTTP/HTTPS проверка поверх TCP (если включена)
+            if HTTP_CHECK_ENABLED and passed:
+                profile.http_check_passed = await self._http_check(profile.host, int(profile.port), profile.scheme)
+    
     async def _tcp_ping(self, host: str, port: int) -> Tuple[float, bool]:
+        """Базовая TCP проверка."""
         started = time.perf_counter()
         writer = None
         try:
@@ -1012,14 +1257,68 @@ class TCPChecker:
                     await writer.wait_closed()
                 except Exception:
                     pass
-            # TCP подключение успешно — профиль рабочий
             return elapsed_ms, True
         except Exception:
-            # Если не удалось подключиться, считаем что проверка не пройдена
             return 0.0, False
         finally:
             if writer and not writer.is_closing():
                 writer.close()
+    
+    async def _tcp_ping_multi_level(self, host: str, port: int) -> Tuple[float, bool, float]:
+        """Многоуровневая TCP-проверка (быстрая/полная) с измерением jitter."""
+        rtts: List[float] = []
+        
+        # Быстрая проверка (1 попытка)
+        rtt, passed = await self._tcp_ping(host, port)
+        if not passed:
+            return 0.0, False, 0.0
+        
+        rtts.append(rtt)
+        
+        # Полная проверка (дополнительные попытки для измерения jitter)
+        if TCP_MULTI_LEVEL_ENABLED:
+            for _ in range(2):  # Еще 2 попытки
+                rtt, passed = await self._tcp_ping(host, port)
+                if passed:
+                    rtts.append(rtt)
+        
+        # Вычисляем jitter (стандартное отклонение RTT)
+        if len(rtts) >= 2:
+            try:
+                jitter = statistics.stdev(rtts)
+            except statistics.StatisticsError:
+                jitter = 0.0
+        else:
+            jitter = 0.0
+        
+        avg_rtt = sum(rtts) / len(rtts) if rtts else 0.0
+        return round(avg_rtt, 2), True, round(jitter, 2)
+    
+    async def _http_check(self, host: str, port: int, scheme: str) -> bool:
+        """HTTP/HTTPS проверка поверх TCP."""
+        try:
+            url = f"https://{host}:{port}/" if scheme in ('vless', 'trojan', 'hy2') or port == 443 else f"http://{host}:{port}/"
+            timeout = aiohttp.ClientTimeout(total=HTTP_CHECK_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, ssl=False) as response:
+                    return response.status < 500
+        except Exception:
+            return False
+    
+    async def resolve_with_cache(self, hostname: str) -> Optional[List[str]]:
+        """DNS запрос с кэшированием."""
+        cached = self.dns_cache.get(hostname)
+        if cached:
+            return cached
+        
+        try:
+            loop = asyncio.get_event_loop()
+            ips = await loop.run_in_executor(None, socket.gethostbyname_ex, hostname)
+            ip_list = list(ips[2])
+            self.dns_cache.set(hostname, ip_list)
+            return ip_list
+        except Exception:
+            return None
 
 
 # =============================================================================
