@@ -1,20 +1,20 @@
 {
   "input_subscriptions": 23,
   "loaded_subscriptions": 23,
-  "channels_found": 3430,
-  "profiles_before_registry_merge": 2356,
-  "profiles_after_registry_merge": 1538,
+  "channels_found": 3432,
+  "profiles_before_registry_merge": 1594,
+  "profiles_after_registry_merge": 1146,
   "profiles_by_protocol": {
-    "vless": 1381,
-    "trojan": 155,
-    "hy2": 2
+    "vless": 1048,
+    "trojan": 94,
+    "hy2": 4
   },
   "tcp_check_enabled": true,
-  "generated_at": "2026-08-07T16:07:01Z",
-  "duplicates_filtered_by_bloom": 1929,
-  "profiles_rate_limited": 1785,
+  "generated_at": "2026-08-07T19:02:20Z",
+  "duplicates_filtered_by_bloom": 1880,
+  "profiles_rate_limited": 1165,
   "channels_on_cooldown": 0,
   "best_channels_count": 122,
   "bad_channels_count": 0,
-  "window_started_at": "2026-08-07T16:06:03Z"
+  "window_started_at": "2026-08-07T19:01:38Z"
 }
