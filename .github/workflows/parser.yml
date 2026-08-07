@@ -19,119 +19,169 @@ jobs:
   parse-subscriptions:
     name: Парсинг подписок и Telegram-каналов
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout репозитория
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      
+
       - name: Настройка Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-      
+
       - name: Установка зависимостей
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
+
       - name: Проверка входных данных
         run: |
           if [ ! -f input.txt ]; then
             echo "Ошибка: файл input.txt не найден!"
             exit 1
           fi
-          echo "Найдено $(wc -l < input.txt) подписок для обработки"
-      
+          COUNT=$(grep -cve '^\s*$' -e '^\s*#' input.txt || true)
+          echo "Найдено $COUNT подписок для обработки"
+
       - name: Запуск парсера
+        env:
+          RUNNER_DEBUG_MODE: ${{ github.event.inputs.debug }}
         run: |
-          echo "Запуск парсера..."
+          echo "Запуск парсера (debug=${RUNNER_DEBUG_MODE})..."
           python parser.py
-          
-          # Проверка результатов
-          if [ -f protocols.txt ]; then
-            echo "✓ Файл protocols.txt создан"
-            echo "  Количество профилей: $(grep -c '^\[' protocols.txt || echo 0)"
+
+          # Итоговые файлы пишутся в output/ и зеркалируются в корень
+          # (см. config.py -> WRITE_MIRROR_FILES_TO_ROOT).
+          if [ -f output/protocols.txt ]; then
+            echo "✓ Файл output/protocols.txt создан"
+            echo "  Количество профилей: $(grep -cve '^\s*$' -e '^\s*#' output/protocols.txt || echo 0)"
           else
-            echo "✗ Файл protocols.txt не создан"
+            echo "✗ Файл output/protocols.txt не создан"
+            exit 1
           fi
-          
-          if [ -f best_channels.txt ]; then
-            echo "✓ Файл best_channels.txt создан"
-            echo "  Количество каналов: $(grep -c '^\[' best_channels.txt || echo 0)"
+
+          if [ -f output/best_channels.txt ]; then
+            echo "✓ Файл output/best_channels.txt создан"
+            echo "  Количество каналов: $(grep -cve '^\s*$' output/best_channels.txt || echo 0)"
           else
-            echo "✗ Файл best_channels.txt не создан"
+            echo "✗ Файл output/best_channels.txt не создан"
           fi
-      
+
+      - name: Чтение статистики запуска
+        id: stats
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          path = os.path.join('output', 'stats.json')
+          data = {}
+          if os.path.exists(path):
+              try:
+                  with open(path, 'r', encoding='utf-8') as fh:
+                      data = json.load(fh)
+              except Exception:
+                  data = {}
+
+          def get(key, default='N/A'):
+              value = data.get(key, default)
+              return str(value)
+
+          print(f"input_subscriptions={get('input_subscriptions')}")
+          print(f"loaded_subscriptions={get('loaded_subscriptions')}")
+          print(f"channels_found={get('channels_found')}")
+          print(f"profiles_after_registry_merge={get('profiles_after_registry_merge')}")
+          print(f"best_channels_count={get('best_channels_count')}")
+          print(f"bad_channels_count={get('bad_channels_count')}")
+          print(f"generated_at={get('generated_at')}")
+          PY
+
       - name: Сохранение артефактов
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: parser-results
+          name: parser-results-${{ github.run_number }}
           path: |
-            protocols.txt
-            best_channels.txt
-            stats.json
+            output/protocols.txt
+            output/best_channels.txt
+            output/bad_channels.txt
+            output/stats.json
+            output/protocols_state.json
             parser.log
           retention-days: 30
           if-no-files-found: warn
-      
-      - name: Коммит и пуш результатов (опционально)
+
+      - name: Коммит и пуш результатов
         run: |
           git config --global user.name 'GitHub Actions Bot'
           git config --global user.email 'actions@github.com'
-          
-          # Добавляем файлы результатов
-          git add protocols.txt best_channels.txt stats.json 2>/dev/null || true
-          
-          # Проверяем есть ли изменения
+
+          # Добавляем как файлы из output/ (включая protocols_state.json —
+          # он обязателен, иначе 7-дневное окно не переживёт следующий запуск),
+          # так и их зеркала в корне репозитория.
+          git add \
+            output/protocols.txt \
+            output/best_channels.txt \
+            output/bad_channels.txt \
+            output/stats.json \
+            output/protocols_state.json \
+            protocols.txt \
+            best_channels.txt \
+            bad_channels.txt \
+            stats.json \
+            2>/dev/null || true
+
           if git diff --staged --quiet; then
             echo "Нет изменений для коммита"
           else
             TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
             git commit -m "🔄 Обновление результатов парсера от ${TIMESTAMP} [skip ci]"
-            
-            # Настраиваем URL репозитория для использования токена
             git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
             git push
             echo "✓ Результаты закоммичены и отправлены в репозиторий"
           fi
-      
-      - name: Создание релиза с результатами (опционально)
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+
+      - name: Создание релиза с результатами
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: parser-run-${{ github.run_number }}
           name: Результаты парсера #${{ github.run_number }}
           body: |
             ## Ручной запуск парсера
-            
-            **Дата:** $(date '+%Y-%m-%d %H:%M:%S')
-            
+
+            **Дата генерации:** ${{ steps.stats.outputs.generated_at }}
+
             ### Статистика:
-            - Обработано подписок: $(cat stats.json 2>/dev/null | grep total_subscriptions | grep -o '[0-9]*' || echo "N/A")
-            - Найдено каналов: $(cat stats.json 2>/dev/null | grep total_channels | grep -o '[0-9]*' || echo "N/A")
-            - Найдено профилей: $(cat stats.json 2>/dev/null | grep total_profiles | grep -o '[0-9]*' || echo "N/A")
-            
+            - Обработано подписок (входных / успешно загруженных): ${{ steps.stats.outputs.input_subscriptions }} / ${{ steps.stats.outputs.loaded_subscriptions }}
+            - Найдено Telegram-каналов: ${{ steps.stats.outputs.channels_found }}
+            - Уникальных профилей в текущем 7-дневном окне: ${{ steps.stats.outputs.profiles_after_registry_merge }}
+            - Хороших каналов / плохих каналов: ${{ steps.stats.outputs.best_channels_count }} / ${{ steps.stats.outputs.bad_channels_count }}
+
             ### Файлы:
-            - `protocols.txt` - Уникальные профили протоколов
-            - `best_channels.txt` - Лучшие Telegram-каналы
-            - `stats.json` - Статистика запуска
+            - `protocols.txt` — уникальные профили протоколов (7-дневное окно)
+            - `best_channels.txt` — лучшие Telegram-каналы
+            - `bad_channels.txt` — плохие Telegram-каналы
+            - `stats.json` — статистика запуска
           files: |
-            protocols.txt
-            best_channels.txt
-            stats.json
+            output/protocols.txt
+            output/best_channels.txt
+            output/bad_channels.txt
+            output/stats.json
           fail_on_error: false
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
-  
+
   notify:
     name: Уведомление о завершении
     runs-on: ubuntu-latest
     needs: parse-subscriptions
     if: always()
-    
+
     steps:
       - name: Статус выполнения
         run: |
