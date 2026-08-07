@@ -3,6 +3,7 @@
 Парсер Telegram-каналов и протоколов из внешних подписок
 Собирает профили VLESS, Trojan, SS, VMess, TUIC, HY2 из подписок и Telegram-каналов
 Оценивает качество каналов и профилей, удаляет дубликаты по IP/домену
+Применяет многоуровневую дедупликацию для сокращения количества профилей
 """
 
 import re
@@ -19,6 +20,9 @@ from bs4 import BeautifulSoup
 import asyncio
 import aiohttp
 import logging
+
+# Импорт модуля дедупликации
+from dedup import run_deduplication, DedupStats
 
 # Настройка логирования
 logging.basicConfig(
@@ -617,10 +621,14 @@ class Parser:
         logger.info("Оценка качества каналов...")
         self.evaluate_channels()
         
+        # Применение дедупликации профилей
+        logger.info("Применение многоуровневой дедупликации профилей...")
+        self.profiles, dedup_stats = run_deduplication(self.profiles, strict_mode=False)
+        logger.info(f"Результат дедупликации: {dedup_stats.summary()}")
+
         # Сохранение результатов
         logger.info("Сохранение результатов...")
-        self.save_results()
-        
+        self.save_results(dedup_stats)
         logger.info("Процесс завершен")
     
     async def process_telegram_channels(self):
@@ -667,7 +675,7 @@ class Parser:
                 channels_list
             )
     
-    def save_results(self):
+    def save_results(self, dedup_stats=None):
         """Сохраняет результаты в файлы"""
         # Сортировка профилей по качеству
         sorted_profiles = sorted(

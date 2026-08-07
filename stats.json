@@ -1,13 +1,14 @@
 {
   "total_subscriptions": 23,
-  "total_channels": 3428,
-  "total_profiles": 58382,
+  "total_channels": 3545,
+  "total_profiles": 56005,
   "profiles_by_protocol": {
-    "vless": 51503,
-    "vmess": 1838,
-    "trojan": 4785,
-    "hy2": 209,
-    "ss": 47
+    "vless": 50828,
+    "vmess": 5,
+    "trojan": 4703,
+    "hy2": 453,
+    "ss": 11,
+    "tuic": 5
   },
-  "timestamp": "2026-08-06T04:31:57.916345"
+  "timestamp": "2026-08-07T05:39:52.720223"
 }
