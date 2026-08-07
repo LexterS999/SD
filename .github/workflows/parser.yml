@@ -30,7 +30,19 @@ jobs:
           python parser.py
           echo "Уведомление о завершении: Парсинг успешно завершен."
 
-      - name: 📤 Upload output artifacts
+      - name: 📤 Commit and push output files
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add output/bad_channels.txt output/best_channels.txt output/protocols.txt output/stats.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update output files [skip ci]"
+            git push
+          fi
+
+      - name: 📦 Upload output artifacts
         uses: actions/upload-artifact@v4
         with:
           name: parser-output
