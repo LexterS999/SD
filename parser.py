@@ -5,14 +5,15 @@
 
 Что делает этот скрипт:
 1. Читает подписки из input.txt.
-2. Достаёт из них профили и Telegram-каналы.
-3. По Telegram берёт только сообщения за последние 7 дней.
-4. Проводит жёсткую канонизацию и дедупликацию профилей.
-5. Разрешает только endpoint'ы с IPv4.
-6. Ведёт 7-дневный реестр profiles/protocols без дублей.
-7. После истечения 7 дней полностью сбрасывает реестр.
-8. Выполняет быструю speed-оценку для каждого профиля.
-9. Сохраняет protocols.txt, best_channels.txt, bad_channels.txt, stats.json.
+2. Извлекает Telegram-каналы из подписок.
+3. Собирает профили ТОЛЬКО из Telegram-каналов, которые есть в best_channels.txt (за последние 7 дней).
+4. По Telegram берёт только сообщения за последние 7 дней.
+5. Проводит жёсткую канонизацию и дедупликацию профилей.
+6. Разрешает только endpoint'ы с IPv4.
+7. Ведёт 7-дневный реестр profiles/protocols без дублей.
+8. После истечения 7 дней полностью сбрасывает реестр.
+9. Выполняет быструю speed-оценку для каждого профиля.
+10. Сохраняет protocols.txt, best_channels.txt, bad_channels.txt, stats.json.
 """
 
 from __future__ import annotations
@@ -164,6 +165,7 @@ LOG_LEVEL = cfg('LOG_LEVEL', 'INFO')
 LOG_FILE = cfg('LOG_FILE', 'parser.log')
 
 PROFILE_WINDOW_DAYS = int(cfg('PROFILE_WINDOW_DAYS', 7))
+CHANNEL_WINDOW_DAYS = int(cfg('CHANNEL_WINDOW_DAYS', 7))
 REGISTRY_RESET_DAYS = int(cfg('REGISTRY_RESET_DAYS', 7))
 MERGE_WITH_PREVIOUS_REGISTRY = bool(cfg('MERGE_WITH_PREVIOUS_REGISTRY', True))
 
@@ -172,6 +174,7 @@ BEST_CHANNELS_FILE_NAME = cfg('BEST_CHANNELS_FILE', 'best_channels.txt')
 BAD_CHANNELS_FILE_NAME = cfg('BAD_CHANNELS_FILE', 'bad_channels.txt')
 STATS_FILE_NAME = cfg('STATS_FILE', 'stats.json')
 PROTOCOLS_STATE_FILE_NAME = cfg('PROTOCOLS_STATE_FILE', 'protocols_state.json')
+CHANNELS_STATE_FILE_NAME = cfg('CHANNELS_STATE_FILE', 'channels_state.json')
 
 USER_AGENT = cfg('USER_AGENT', 'Mozilla/5.0')
 SUBSCRIPTION_FETCH_TIMEOUT = float(cfg('SUBSCRIPTION_FETCH_TIMEOUT', 25))
@@ -208,7 +211,7 @@ PROFILE_WEIGHTS = dict(cfg('PROFILE_WEIGHTS', {}))
 CHANNEL_WEIGHTS = dict(cfg('CHANNEL_WEIGHTS', {}))
 PROTOCOL_PATTERNS = dict(cfg('PROTOCOL_PATTERNS', {}))
 TG_PATTERNS = list(cfg('TG_PATTERNS', []))
-EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS = bool(cfg('EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS', True))
+EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS = bool(cfg('EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS', False))
 DEDUPLICATE_BY_ENDPOINT = bool(cfg('DEDUPLICATE_BY_ENDPOINT', True))
 PROFILE_TAG_LENGTH = int(cfg('PROFILE_TAG_LENGTH', 7))
 PROFILE_TAG_ALPHABET = str(cfg('PROFILE_TAG_ALPHABET', 'abcdefghijklmnopqrstuvwxyz0123456789'))
@@ -218,6 +221,7 @@ BEST_CHANNELS_FILE = os.path.join(OUTPUT_DIR, BEST_CHANNELS_FILE_NAME)
 BAD_CHANNELS_FILE = os.path.join(OUTPUT_DIR, BAD_CHANNELS_FILE_NAME)
 STATS_FILE = os.path.join(OUTPUT_DIR, STATS_FILE_NAME)
 PROTOCOLS_STATE_FILE = os.path.join(OUTPUT_DIR, PROTOCOLS_STATE_FILE_NAME)
+CHANNELS_STATE_FILE = os.path.join(OUTPUT_DIR, CHANNELS_STATE_FILE_NAME)
 
 REGISTRY_VERSION = 2
 DECORATIVE_KEYS = {'title', 'name', 'ps', 'remark', 'remarks', 'description', 'tag'}
@@ -1316,33 +1320,34 @@ class Parser:
         self.subscriptions = await SubscriptionFetcher.fetch_all(urls)
         self.stats['loaded_subscriptions'] = len(self.subscriptions)
 
-        logger.info('Извлечение профилей и Telegram-каналов из подписок...')
-        all_profiles_raw = []
+        logger.info('Извлечение Telegram-каналов из подписок...')
         for content in self.subscriptions.values():
-            if EXTRACT_DIRECT_PROFILES_FROM_SUBSCRIPTIONS:
-                for profile in ProtocolParser.extract_protocols(content):
-                    all_profiles_raw.append(profile.render_for_output())
             for lower, original in ProtocolParser.extract_telegram_channels(content).items():
                 self.channels.setdefault(lower, TelegramChannel(username=original, url=f'https://t.me/{original}'))
 
-        # Применяем агрессивную дедупликацию к сырым профилям
-        logger.info('Применение агрессивной дедупликации (dedup.py)...')
-        deduplicated_raw = aggressive_deduplicate(all_profiles_raw)
-        
-        # Парсим дедуплицированные профили обратно в объекты ProtocolProfile
-        for raw_profile in deduplicated_raw:
-            profile_obj = ProtocolParser.parse(raw_profile)
-            if profile_obj:
-                self.register_profile(profile_obj)
-
         self.stats['channels_found'] = len(self.channels)
         logger.info('Найдено каналов: %s', len(self.channels))
-        logger.info('Найдено уникальных профилей до Telegram/реестра: %s', len(self.current_profiles))
+
+        # Загружаем список лучших каналов из best_channels.txt за последние 7 дней
+        allowed_channels = self.load_allowed_channels()
+        logger.info('Загружено разрешенных каналов из best_channels.txt: %s', len(allowed_channels))
+
+        # Фильтруем каналы: оставляем только те, что есть в best_channels.txt
+        if allowed_channels:
+            filtered_channels = {k: v for k, v in self.channels.items() if k in allowed_channels}
+            removed_count = len(self.channels) - len(filtered_channels)
+            if removed_count > 0:
+                logger.info('Отфильтровано каналов (не входят в best_channels.txt): %s', removed_count)
+            self.channels = filtered_channels
+        else:
+            logger.info('best_channels.txt пуст или отсутствует — будут обработаны все найденные каналы')
 
         if self.channels:
             await self.process_telegram_channels()
 
         self.stats['profiles_before_registry_merge'] = len(self.current_profiles)
+
+        logger.info('Найдено уникальных профилей из Telegram-каналов: %s', len(self.current_profiles))
 
         await self.measure_reference_speed()
 
@@ -1441,6 +1446,32 @@ class Parser:
                 channel.protocols_found[profile.protocol] = channel.protocols_found.get(profile.protocol, 0) + 1
             channel.profiles_count = len(unique_for_channel)
             channel.last_updated = utcnow()
+
+    def load_allowed_channels(self) -> set:
+        """Загружает список разрешенных каналов из best_channels.txt.
+        Файл содержит URL каналов, которые были отобраны как лучшие за последние 7 дней.
+        Возвращает множество lowercase username каналов.
+        """
+        allowed = set()
+        if not os.path.exists(BEST_CHANNELS_FILE):
+            return allowed
+        try:
+            with open(BEST_CHANNELS_FILE, 'r', encoding=OUTPUT_ENCODING) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    # Извлекаем username из URL вида https://t.me/username или t.me/username
+                    if 't.me/' in line:
+                        username = line.split('t.me/')[-1].split('/')[0].split('?')[0].lower()
+                        allowed.add(username)
+                    elif line.startswith('@'):
+                        allowed.add(line[1:].lower())
+                    else:
+                        allowed.add(line.lower())
+        except Exception as exc:
+            logger.warning('Не удалось загрузить best_channels.txt: %s', exc)
+        return allowed
 
     def evaluate_channels(self) -> None:
         channels_list = list(self.channels.values())

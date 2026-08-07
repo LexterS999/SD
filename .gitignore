@@ -1,12 +1,26 @@
-```yaml
-# Configuration and workflow files
-.github/workflows/parser.yml
 ```
+# Compiled and build artifacts
+*.pyc
+__pycache__/
 
-Wait, I need to reconsider this. The file `.github/workflows/parser.yml` is a configuration file that should typically be committed to version control, not ignored. Since it's a GitHub Actions workflow file, it's part of the project's configuration and should be tracked.
+# Dependencies
+.venv/
+venv/
 
-Given that only a single configuration file was modified and no build artifacts, dependencies, or temporary files were included in the changes, the appropriate output is empty.
+# Logs and temp files
+*.log
+*.tmp
+*.swp
 
-```yaml
+# Environment
+.env
+.env.local
+*.env.*
 
+# Editors
+.vscode/
+.idea/
+
+# Original rules preserved
+*.log
 ```
