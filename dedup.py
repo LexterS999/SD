@@ -2,9 +2,13 @@ import re
 import base64
 import json
 import logging
+import os
 from urllib.parse import urlparse, parse_qs, unquote
 
 logger = logging.getLogger(__name__)
+
+# Получаем уровень дедупликации из переменной окружения (устанавливается в GitHub Actions)
+DEDUP_LEVEL = os.environ.get('DEDUP_LEVEL', 'medium').lower()
 
 def normalize_profile(uri):
     """Нормализует профиль для дедупликации (без вреда для качества)."""
@@ -78,14 +82,53 @@ def get_host_port(uri):
             return f"{parts[1]}:{parts[2]}"
     return None
 
-def aggressive_deduplicate(profiles):
-    """Применяет все возможные фильтры для сокращения объема профилей."""
+def get_host_only(uri):
+    """Извлекает только хост для сверх-агрессивной дедупликации."""
+    norm = normalize_profile(uri)
+    if norm:
+        parts = norm.split('|')
+        if len(parts) >= 2:
+            return parts[1]
+    return None
+
+def light_deduplicate(profiles):
+    """
+    ЛЕГКИЙ уровень дедупликации:
+    - Удаляет только полные дубликаты (одинаковые URI после нормализации)
+    - Сохраняет все профили с разными настройками
+    """
     initial_count = len(profiles)
-    logger.info(f"Запуск глубокой дедупликации. Исходное количество: {initial_count}")
+    logger.info(f"[ЛЕГКИЙ] Запуск дедупликации. Исходное количество: {initial_count}")
+    
+    unique_profiles = {}
+    
+    for p in profiles:
+        key = normalize_profile(p)
+        if not key:
+            continue
+            
+        # Только строгая дедупликация по полному ключу
+        if key not in unique_profiles:
+            unique_profiles[key] = p
+    
+    final_profiles = list(unique_profiles.values())
+    final_count = len(final_profiles)
+    logger.info(f"[ЛЕГКИЙ] Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
+    
+    return final_profiles
+
+def medium_deduplicate(profiles):
+    """
+    СРЕДНИЙ уровень дедупликации (по умолчанию):
+    - Удаляет полные дубликаты
+    - Удаляет дубликаты по IP:Port (один профиль на сервер:порт)
+    """
+    initial_count = len(profiles)
+    logger.info(f"[СРЕДНИЙ] Запуск дедупликации. Исходное количество: {initial_count}")
     
     unique_profiles = {}
     seen_host_port = set()
-
+    
     for p in profiles:
         key = normalize_profile(p)
         if not key:
@@ -94,9 +137,8 @@ def aggressive_deduplicate(profiles):
         # Уровень 1: Строгая дедупликация (одинаковые URI/настройки)
         if key in unique_profiles:
             continue
-
-        # Уровень 2: Дедупликация по IP:Port (оставляем только 1 профиль на 1 сервер:порт)
-        # Это радикально сократит количество, убрав дубликаты серверов с разными UUID
+        
+        # Уровень 2: Дедупликация по IP:Port
         hp = get_host_port(p)
         if hp and hp in seen_host_port:
             continue
@@ -105,9 +147,77 @@ def aggressive_deduplicate(profiles):
             seen_host_port.add(hp)
             
         unique_profiles[key] = p
-
+    
     final_profiles = list(unique_profiles.values())
     final_count = len(final_profiles)
-    logger.info(f"Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
+    logger.info(f"[СРЕДНИЙ] Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
     
     return final_profiles
+
+def aggressive_deduplicate(profiles):
+    """
+    АГРЕССИВНЫЙ уровень дедупликации:
+    - Удаляет полные дубликаты
+    - Удаляет дубликаты по IP:Port
+    - Удаляет дубликаты только по хосту (один профиль на домен/IP)
+    """
+    initial_count = len(profiles)
+    logger.info(f"[АГРЕССИВНЫЙ] Запуск дедупликации. Исходное количество: {initial_count}")
+    
+    unique_profiles = {}
+    seen_host_port = set()
+    seen_hosts = set()
+    
+    for p in profiles:
+        key = normalize_profile(p)
+        if not key:
+            continue
+            
+        # Уровень 1: Строгая дедупликация (одинаковые URI/настройки)
+        if key in unique_profiles:
+            continue
+        
+        # Уровень 2: Дедупликация по IP:Port
+        hp = get_host_port(p)
+        if hp and hp in seen_host_port:
+            continue
+            
+        # Уровень 3: Дедупликация только по хосту
+        host = get_host_only(p)
+        if host and host in seen_hosts:
+            continue
+        
+        if hp:
+            seen_host_port.add(hp)
+        if host:
+            seen_hosts.add(host)
+            
+        unique_profiles[key] = p
+    
+    final_profiles = list(unique_profiles.values())
+    final_count = len(final_profiles)
+    logger.info(f"[АГРЕССИВНЫЙ] Дедупликация завершена. Удалено дубликатов: {initial_count - final_count}. Осталось: {final_count}")
+    
+    return final_profiles
+
+def deduplicate(profiles, level=None):
+    """
+    Универсальная функция дедупликации с выбором уровня.
+    
+    Args:
+        profiles: Список профилей для дедупликации
+        level: Уровень дедупликации ('light', 'medium', 'aggressive')
+               Если None, используется значение из переменной окружения DEDUP_LEVEL
+    """
+    if level is None:
+        level = DEDUP_LEVEL
+    
+    if level == 'light':
+        return light_deduplicate(profiles)
+    elif level == 'aggressive':
+        return aggressive_deduplicate(profiles)
+    else:  # medium по умолчанию
+        return medium_deduplicate(profiles)
+
+# Для обратной совместимости оставляем старую функцию
+aggressive_deduplicate_old = aggressive_deduplicate

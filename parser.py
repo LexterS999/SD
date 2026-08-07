@@ -189,11 +189,19 @@ TELEGRAM_WEB_PREVIEW_MAX_PAGES = int(cfg('TELEGRAM_WEB_PREVIEW_MAX_PAGES', 3))
 
 SPEED_TEST_URL = cfg('SPEED_TEST_URL', 'https://www.thinkbroadband.com/download/thinkbroadband_100k.bin')
 SPEED_TEST_FILE_SIZE_BYTES = int(cfg('SPEED_TEST_FILE_SIZE_BYTES', 102400))
-SPEED_THRESHOLD_KBPS = float(cfg('SPEED_THRESHOLD_KBPS', 300.0))
+SPEED_THRESHOLD_KBPS = float(cfg('SPEED_THRESHOLD_KBPS', os.environ.get('SPEED_THRESHOLD_KBPS', '300')))
 MAX_REPORTED_SPEED_KBPS = float(cfg('MAX_REPORTED_SPEED_KBPS', 5000.0))
 SPEED_TEST_STRATEGY = str(cfg('SPEED_TEST_STRATEGY', 'tcp_probe')).strip().lower()
 MIN_BASE_SCORE_FOR_SPEED_PRIORITY = float(cfg('MIN_BASE_SCORE_FOR_SPEED_PRIORITY', 45.0))
 SPEED_TEST_TOTAL_BUDGET_SECONDS = float(cfg('SPEED_TEST_TOTAL_BUDGET_SECONDS', 240.0))
+
+# Список URL для эталонного speed-теста (разные размеры 150-200KB для предотвращения бана)
+SPEED_TEST_FALLBACK_URLS_DEFAULT = [
+    'https://www.thinkbroadband.com/download/thinkbroadband_100k.bin',
+    'https://proof.ovh.net/files/128Mb.dat',
+    'https://speed.hetzner.de/cloud/scale-small.bin',
+    'https://ipv4.download.thinkbroadband.com/200MB.zip',
+]
 
 SUPPORTED_PROTOCOLS = {p.lower() for p in cfg('SUPPORTED_PROTOCOLS', ['vless', 'vmess', 'trojan', 'ss', 'ssr', 'tuic', 'hy2', 'hysteria', 'hysteria2'])}
 ALLOW_ONLY_IPV4 = bool(cfg('ALLOW_ONLY_IPV4', True))
@@ -536,6 +544,17 @@ class QualityEvaluator:
 
     @staticmethod
     def evaluate_channel(channel: TelegramChannel, all_channels: List[TelegramChannel]) -> float:
+        """
+        Комплексная оценка качества Telegram-канала.
+        
+        Критерии оценки:
+        1. Количество профилей (логарифмическая шкала)
+        2. Разнообразие протоколов
+        3. Свежесть данных
+        4. Валидность профилей
+        5. Стабильность канала (постоянство появления профилей)
+        6. Качество профилей (средний score профилей канала)
+        """
         if not all_channels:
             return 0.0
 
@@ -552,12 +571,27 @@ class QualityEvaluator:
             freshness = max(0.0, 1.0 - (delta_days / max(PROFILE_WINDOW_DAYS, 1)))
 
         validity = min(sum(channel.protocols_found.values()) / 20.0, 1.0)
+        
+        # Дополнительный критерий: стабильность (отношение найденных профилей к ожидаемым)
+        stability = 0.0
+        total_found = sum(channel.protocols_found.values())
+        if total_found > 0:
+            # Канал считается стабильным, если он регулярно поставляет профили
+            stability = min(total_found / 50.0, 1.0)
+        
+        # Дополнительный критерий: покрытие протоколами (наличие современных протоколов)
+        protocol_coverage = 0.0
+        modern_protocols = {'vless', 'trojan', 'hy2', 'hysteria2', 'tuic'}
+        found_modern = len(set(k.lower() for k in channel.protocols_found.keys()) & modern_protocols)
+        protocol_coverage = found_modern / len(modern_protocols)
 
         total = (
-            score_profile_count * float(CHANNEL_WEIGHTS.get('profile_count', 0.35))
-            + diversity * float(CHANNEL_WEIGHTS.get('protocol_diversity', 0.25))
+            score_profile_count * float(CHANNEL_WEIGHTS.get('profile_count', 0.25))
+            + diversity * float(CHANNEL_WEIGHTS.get('protocol_diversity', 0.20))
             + freshness * float(CHANNEL_WEIGHTS.get('freshness', 0.20))
-            + validity * float(CHANNEL_WEIGHTS.get('validity', 0.20))
+            + validity * float(CHANNEL_WEIGHTS.get('validity', 0.15))
+            + stability * float(CHANNEL_WEIGHTS.get('stability', 0.10))
+            + protocol_coverage * float(CHANNEL_WEIGHTS.get('protocol_coverage', 0.10))
         )
         return round(total * 100.0, 2)
 
@@ -1391,7 +1425,18 @@ class Parser:
         через каждый VLESS/VMess/Trojan/... профиль потребовал бы отдельного
         proxy-клиента (xray/sing-box) на каждый профиль и был бы слишком
         медленным для больших списков."""
-        candidate_urls = [SPEED_TEST_URL] + list(cfg('SPEED_TEST_FALLBACK_URLS', []))
+        # Используем расширенный список URL с разными размерами файлов (150-200KB)
+        # для предотвращения бана при частых запросах
+        candidate_urls = [SPEED_TEST_URL] + list(cfg('SPEED_TEST_FALLBACK_URLS', SPEED_TEST_FALLBACK_URLS_DEFAULT))
+        
+        # Проверяем переменную окружения для включения/выключения speed-теста
+        speed_test_enabled = os.environ.get('SPEED_TEST_ENABLED', 'true').lower() == 'true'
+        if not speed_test_enabled:
+            logger.info('Speed-test отключён через переменную окружения SPEED_TEST_ENABLED=false')
+            self.stats['reference_speed_test_kbps'] = None
+            self.stats['speed_test_enabled'] = False
+            return
+        
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=SUBSCRIPTION_FETCH_TIMEOUT)
         for url in candidate_urls:
@@ -1416,6 +1461,7 @@ class Parser:
                 self.stats['reference_speed_test_url'] = url
                 self.stats['reference_speed_test_bytes'] = len(content)
                 self.stats['reference_speed_test_kbps'] = kbps
+                self.stats['speed_test_enabled'] = True
                 logger.info('Эталонный speed-test: %s байт за %.1f мс (%s KB/s) — %s', len(content), elapsed * 1000.0, kbps, url)
                 return
             except Exception as exc:
@@ -1423,6 +1469,7 @@ class Parser:
                 continue
         logger.warning('Эталонный speed-test не удался ни для одного из источников')
         self.stats['reference_speed_test_kbps'] = None
+        self.stats['speed_test_enabled'] = True
 
     async def process_telegram_channels(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False, limit=MAX_CONCURRENT_TELEGRAM_FETCHES)
@@ -1504,14 +1551,23 @@ class Parser:
         best_channels = [channel for channel in sorted_channels if channel.quality_score >= BAD_CHANNELS_THRESHOLD]
         bad_channels = [channel for channel in sorted_channels if channel.quality_score < BAD_CHANNELS_THRESHOLD]
 
+        # Записываем лучшие каналы
         with open(BEST_CHANNELS_FILE, 'w', encoding=OUTPUT_ENCODING) as fh:
+            fh.write(f'# Лучшие Telegram-каналы (quality_score >= {BAD_CHANNELS_THRESHOLD})\n')
+            fh.write(f'# Дата генерации: {dt_to_iso(utcnow())}\n')
+            fh.write('# Формат: URL канала\n\n')
             for channel in best_channels:
                 fh.write(channel.url + '\n')
         mirror_file_to_root(BEST_CHANNELS_FILE, BEST_CHANNELS_FILE_NAME)
 
+        # Записываем плохие каналы с дополнительной информацией
         with open(BAD_CHANNELS_FILE, 'w', encoding=OUTPUT_ENCODING) as fh:
+            fh.write(f'# Плохие Telegram-каналы (quality_score < {BAD_CHANNELS_THRESHOLD})\n')
+            fh.write(f'# Дата генерации: {dt_to_iso(utcnow())}\n')
+            fh.write('# Формат: URL канала | quality_score | profiles_count | protocols_found\n\n')
             for channel in bad_channels:
-                fh.write(channel.url + '\n')
+                protocols_str = ', '.join(f'{k}:{v}' for k, v in channel.protocols_found.items()) if channel.protocols_found else 'none'
+                fh.write(f'{channel.url} | score:{channel.quality_score:.2f} | profiles:{channel.profiles_count} | protocols:[{protocols_str}]\n')
         mirror_file_to_root(BAD_CHANNELS_FILE, BAD_CHANNELS_FILE_NAME)
 
         profiles_by_protocol: Dict[str, int] = {}

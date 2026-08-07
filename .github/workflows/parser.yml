@@ -4,6 +4,26 @@ on:
   schedule:
     - cron: '0 */3 * * *' # Запуск каждые 3 часа
   workflow_dispatch:
+    inputs:
+      dedup_level:
+        description: 'Уровень дедупликации (light, medium, aggressive)'
+        required: false
+        default: 'medium'
+        type: choice
+        options:
+          - light
+          - medium
+          - aggressive
+      speed_test_enabled:
+        description: 'Включить проверку скорости'
+        required: false
+        default: true
+        type: boolean
+      speed_threshold_kbps:
+        description: 'Минимальный порог скорости (KB/s)'
+        required: false
+        default: '300'
+        type: string
 
 permissions:
   contents: write
@@ -24,6 +44,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: ⚙️ Setup environment variables
+        run: |
+          echo "DEDUP_LEVEL=${{ github.event.inputs.dedup_level || 'medium' }}" >> $GITHUB_ENV
+          echo "SPEED_TEST_ENABLED=${{ github.event.inputs.speed_test_enabled || 'true' }}" >> $GITHUB_ENV
+          echo "SPEED_THRESHOLD_KBPS=${{ github.event.inputs.speed_threshold_kbps || '300' }}" >> $GITHUB_ENV
 
       - name: 🚀 Парсинг и Уведомление
         run: |
