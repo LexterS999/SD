@@ -83,7 +83,7 @@ TELEGRAM_MESSAGES_LIMIT = int(cfg('TELEGRAM_MESSAGES_LIMIT', 100))
 TELEGRAM_WEB_PREVIEW_ENABLED = bool(cfg('TELEGRAM_WEB_PREVIEW_ENABLED', True))
 TELEGRAM_WEB_PREVIEW_MAX_PAGES = int(cfg('TELEGRAM_WEB_PREVIEW_MAX_PAGES', 3))
 
-SPEED_TEST_URL = cfg('SPEED_TEST_URL', 'http://speedtest.tele2.net/100KB.zip')
+SPEED_TEST_URL = cfg('SPEED_TEST_URL', 'https://www.thinkbroadband.com/download/thinkbroadband_100k.bin')
 SPEED_TEST_FILE_SIZE_BYTES = int(cfg('SPEED_TEST_FILE_SIZE_BYTES', 102400))
 SPEED_THRESHOLD_KBPS = float(cfg('SPEED_THRESHOLD_KBPS', 300.0))
 MAX_REPORTED_SPEED_KBPS = float(cfg('MAX_REPORTED_SPEED_KBPS', 5000.0))
@@ -260,7 +260,8 @@ def validate_ip_like_query_values(pairs: Sequence[Tuple[str, str]]) -> bool:
 
 def cleaned_netloc(userinfo: str, host: str, port: str) -> str:
     if userinfo:
-        return f"{quote(userinfo, safe=':@-._~!$&\'()*+,;=')}@{host}:{port}"
+        safe_chars = ':@-._~!$&\'()*+,;='
+    return f"{quote(userinfo, safe=safe_chars)}@{host}:{port}"
     return f'{host}:{port}'
 
 
