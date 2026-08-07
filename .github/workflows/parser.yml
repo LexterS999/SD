@@ -10,16 +10,6 @@ on:
         required: false
         default: '7'
         type: string
-      dedup_level:
-        description: 'Уровень дедупликации (off, light, medium, aggressive)'
-        required: false
-        default: 'medium'
-        type: choice
-        options:
-          - off
-          - light
-          - medium
-          - aggressive
       tcp_check_enabled:
         description: 'Включить TCP проверку профилей на работоспособность'
         required: false
@@ -48,7 +38,6 @@ jobs:
 
       - name: ⚙️ Setup environment variables
         run: |
-          echo "DEDUP_LEVEL=${{ github.event.inputs.dedup_level || 'medium' }}" >> $GITHUB_ENV
           echo "TCP_CHECK_ENABLED=${{ github.event.inputs.tcp_check_enabled || 'true' }}" >> $GITHUB_ENV
           echo "COLLECTION_PERIOD_DAYS=${{ github.event.inputs.collection_period_days || '7' }}" >> $GITHUB_ENV
 
