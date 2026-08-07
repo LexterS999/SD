@@ -1,20 +1,20 @@
 {
   "input_subscriptions": 23,
   "loaded_subscriptions": 23,
-  "channels_found": 3554,
-  "profiles_before_registry_merge": 43786,
-  "profiles_after_registry_merge": 43786,
+  "channels_found": 3525,
+  "profiles_before_registry_merge": 1869,
+  "profiles_after_registry_merge": 1869,
   "profiles_by_protocol": {
-    "vless": 39658,
-    "trojan": 3521,
-    "hy2": 603,
-    "tuic": 4
+    "vless": 1707,
+    "trojan": 146,
+    "hy2": 15,
+    "tuic": 1
   },
   "speed_test_url": "https://www.thinkbroadband.com/download/thinkbroadband_100k.bin",
   "speed_test_strategy": "tcp_probe",
-  "generated_at": "2026-08-07T05:02:10Z",
+  "generated_at": "2026-08-07T06:57:29Z",
   "reference_speed_test_kbps": null,
   "best_channels_count": 124,
-  "bad_channels_count": 3430,
-  "window_started_at": "2026-08-07T04:58:21Z"
+  "bad_channels_count": 0,
+  "window_started_at": "2026-08-07T06:56:58Z"
 }
