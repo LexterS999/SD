@@ -1,7 +1,5 @@
 # Плохие Telegram-каналы (не прошли порог quality_score < 20.0)
 # Период сбора данных: 7 дн.
-# Дата генерации: 2026-08-08T15:33:33Z
+# Дата генерации: 2026-08-08T18:42:21Z
 # Формат: URL канала | quality_score | profiles_count | protocols_found
 
-https://t.me/v2ray_vpn_ir | score:0.00 | profiles:0 | protocols:[none]
-https://t.me/Hiddify_Nexttt | score:0.00 | profiles:0 | protocols:[none]
