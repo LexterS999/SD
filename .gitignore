@@ -1,10 +1,1 @@
-```
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Logs
-*.log
-```
+Nothing needs to be added to .gitignore since the changes only include source code files (.py files) and no build artifacts, dependencies, or temporary files.

@@ -421,3 +421,74 @@ SEND_PROGRESS_REPORTS = False
 # Интервал отчетов о ходе обработки (в процентах от 0 до 100).
 # Например, 25 означает отчеты на 25%, 50%, 75% и 100%.
 PROGRESS_REPORT_INTERVAL = 25
+
+# =============================================
+# НОВЫЕ НАСТРОЙКИ (Features #8-24)
+# =============================================
+
+# Детекция типа сети: Residential vs Datacenter vs CDN
+# ASN базы для классификации IP
+DETECT_NETWORK_TYPE = True
+KNOWN_CDN_ASN = ["13335", "20940", "394", "395", "14618", "16509", "8075", "32934"]  # Cloudflare, Akamai, Amazon, Microsoft, Meta, etc.
+KNOWN_DATACENTER_ASN_PARTS = ["hosting", "datacenter", "server", "cloud", "colo"]
+RESIDENTIAL_ISP_KEYWORDS = ["telecom", "broadband", "cable", "fiber", "dsl", "isp", "communications"]
+
+# Санитаризация SNI/Host/Remark
+SANITIZE_SNI_HOST = True
+REMOVE_TELEGRAM_ADS_FROM_REMARK = True
+SPAM_KEYWORDS = ["@", "t.me/", "telegram.me", "channel", "subscribe", "promo", "bonus", "free", "unlimited"]
+
+# TLS/Reality Handshake валидация
+TLS_HANDSHAKE_CHECK_ENABLED = True
+TLS_HANDSHAKE_TIMEOUT = 5.0
+REALITY_PBK_MIN_LENGTH = 32
+REALITY_SID_MIN_LENGTH = 8
+REALITY_SID_MAX_LENGTH = 64
+
+# Реальный Egress HTTP тест
+EGRESS_HTTP_TEST_ENABLED = True
+EGRESS_TEST_URLS = ["https://httpbin.org/ip", "https://google.com"]
+EGRESS_TEST_TIMEOUT = 10.0
+EGRESS_TEST_TOP_N = 100  # Тестировать только топ-N профилей
+
+# Проверка разблокировки сервисов
+STREAMING_TEST_ENABLED = True
+STREAMING_TEST_URLS = {
+    "ChatGPT": "https://chat.openai.com",
+    "YouTube": "https://www.youtube.com",
+    "Netflix": "https://www.netflix.com",
+    "Spotify": "https://open.spotify.com",
+}
+STREAMING_TEST_TIMEOUT = 8.0
+STREAMING_TEST_TOP_N = 50  # Тестировать только топ-N профилей
+
+# Фильтрация Honeypot / Заблокированных IP
+HONEYPOT_FILTER_ENABLED = True
+RKN_GFW_BLOCKED_SUBNETS = []  # Можно добавить списки заблокированных подсетей
+HONEYPOT_IP_PATTERNS = ["0.0.0.0", "127.0.0.1", "10.", "172.16.", "192.168."]
+
+# Измерение скорости для Топ-100 профилей
+SPEED_TEST_TOP_N = 100
+SPEED_TEST_ENABLED = True
+
+# Полная сырая база кандидатов
+SAVE_ALL_RAW_CANDIDATES = True
+ALL_RAW_CANDIDATES_FILE = "output/all_raw_candidates.txt"
+
+# Человекочитаемый Markdown-отчет
+GENERATE_MARKDOWN_REPORT = True
+MARKDOWN_REPORT_FILE = "output/SUMMARY.md"
+
+# Полный JSON-реестр с техническими характеристиками
+GENERATE_DETAILED_JSON = True
+DETAILED_JSON_FILE = "output/protocols_detailed.json"
+
+# История изменений и дельта выгрузки
+TRACK_CHANGES = True
+CHANGELOG_FILE = "output/changelog.json"
+DIFF_ADDED_FILE = "output/diff_added.txt"
+
+# Матрица здоровья каналов-источников
+GENERATE_CHANNEL_HEALTH_MATRIX = True
+CHANNEL_HEALTH_MATRIX_FILE = "output/channel_health_matrix.json"
+
