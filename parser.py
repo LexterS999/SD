@@ -50,6 +50,11 @@ try:
 except ImportError:  # pragma: no cover
     config = None
 
+try:
+    import features
+except ImportError:  # pragma: no cover
+    features = None
+
 
 # =============================================================================
 # НАСТРОЙКИ
@@ -2002,6 +2007,26 @@ class Parser:
 
         logger.info('Сохранено профилей: %s', len(sorted_profiles))
         logger.info('Лучших каналов: %s | Плохих каналов: %s', len(best_channels), len(bad_channels))
+        
+        # Запуск дополнительных функций (Features #8-24)
+        if features:
+            try:
+                # Применяем санитаризацию ко всем профилям
+                for profile in sorted_profiles:
+                    features.apply_sanitization_to_profile(profile)
+                
+                # Обогащаем профили информацией о типе сети
+                for profile in sorted_profiles:
+                    features.enrich_profile_with_network_info(profile)
+                
+                # Запускаем генерацию отчетов и трекинг изменений
+                asyncio.create_task(features.run_feature_tests(
+                    sorted_profiles,
+                    list(self.channels.values()),
+                    self.stats
+                ))
+            except Exception as e:
+                logger.warning(f'Ошибка при выполнении дополнительных функций: {e}')
 
 
 async def main() -> None:
