@@ -1,6 +1,6 @@
 # Лучшие Telegram-каналы (quality_score >= 20.0)
 # Период сбора данных: 7 дн.
-# Дата генерации: 2026-08-08T01:50:50Z
+# Дата генерации: 2026-08-08T04:13:06Z
 # Формат: URL канала
 
 https://t.me/AR14N24b
@@ -9,12 +9,12 @@ https://t.me/VPNine1
 https://t.me/SOSkeyNET
 https://t.me/soskeynets
 https://t.me/meliproxyy
-https://t.me/Hope_Net
 https://t.me/v2ray_configs_pools
 https://t.me/Farah_VPN
 https://t.me/tootffarangi
 https://t.me/V2ray_confing33
 https://t.me/chillguy_vpn
+https://t.me/Hope_Net
 https://t.me/SHAHSERVER1
 https://t.me/FarazV2ray
 https://t.me/V2All
@@ -22,9 +22,9 @@ https://t.me/FreakConfig
 https://t.me/Tunder_vpn
 https://t.me/MdVpnSec
 https://t.me/clashv8
-https://t.me/irconfiig
 https://t.me/Daily_Configs
 https://t.me/hex_proxy
+https://t.me/irconfiig
 https://t.me/kurdconfig
 https://t.me/icv2ray
 https://t.me/MTMVPN
@@ -36,8 +36,8 @@ https://t.me/vmesskhodam
 https://t.me/V2ray_Alpha
 https://t.me/vpnv2r4y
 https://t.me/MARAMBASHI
-https://t.me/v2ray313
 https://t.me/networld_vpn
+https://t.me/v2ray313
 https://t.me/iProxyChannel
 https://t.me/ConfingV2RaayNG
 https://t.me/vpnsal
@@ -48,6 +48,7 @@ https://t.me/configprxy
 https://t.me/bored_vpn
 https://t.me/Napsternetvirani
 https://t.me/v2rayNG_Matsuri
+https://t.me/ConfigsHub
 https://t.me/VConfing
 https://t.me/PrivateVPNs
 https://t.me/TGRVPN
@@ -58,29 +59,28 @@ https://t.me/vpnserverrr
 https://t.me/outline_ir
 https://t.me/vmesc
 https://t.me/V2ray_Collector
-https://t.me/IRAN_V2RAY1
-https://t.me/Outline_VPN
-https://t.me/BigSmoke_Config
-https://t.me/v2ray_phoenix
 https://t.me/GozargahAzad
+https://t.me/IRAN_V2RAY1
+https://t.me/BigSmoke_Config
+https://t.me/Outline_Vpn
+https://t.me/v2ray_phoenix
 https://t.me/AzadMarz
 https://t.me/erfanandroid
 https://t.me/HesarWeb
 https://t.me/prrofile_purple
 https://t.me/ShadowFlux2
-https://t.me/ConfigsHub
 https://t.me/Surfboardv2ray
 https://t.me/bigAVPN
 https://t.me/Arvand_soul
 https://t.me/ISVvpn
-https://t.me/zdyz2
 https://t.me/V2RayyNGvpn
 https://t.me/TEHRANARGO
 https://t.me/generalconfiig
-https://t.me/V2rayN5
-https://t.me/sil3nt_network
 https://t.me/freenettir
+https://t.me/zdyz2
+https://t.me/V2rayN5
 https://t.me/vpnbaz
+https://t.me/sil3nt_network
 https://t.me/flyv2ray
 https://t.me/v2rayng3
 https://t.me/V2XNET
